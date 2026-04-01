@@ -1,1 +1,7 @@
-.worktrees/
+node_modules/
+dist/
+dist-electron/
+*.log
+.DS_Store
+.env.local
+.env.*.local
