@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Plus, Trash2 } from 'lucide-react'
-import type { AppSettings, BudgetInput, BudgetProgress, BudgetsPayload } from '../../shared/types'
+import type { AppSettings, BudgetInput, BudgetProgress, BudgetTemplate, BudgetTemplateInput, BudgetsPayload } from '../../shared/types'
 import { BudgetDialog } from '@/components/budgets/BudgetDialog'
+import { BudgetTemplateDialog } from '@/components/budgets/BudgetTemplateDialog'
 import { CircularGauge } from '@/components/shared/CircularGauge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { PageHeader } from '@/components/shared/PageHeader'
@@ -19,6 +20,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Progress } from '@/components/ui/progress'
+import { Skeleton } from '@/components/ui/skeleton'
 import { currentMonthValue, formatCurrency } from '@/lib/format'
 import { ipc } from '@/lib/ipc'
 
@@ -26,8 +28,11 @@ export function BudgetsPage() {
   const [month, setMonth] = useState(currentMonthValue())
   const [payload, setPayload] = useState<BudgetsPayload | null>(null)
   const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [templates, setTemplates] = useState<BudgetTemplate[]>([])
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [templateDialogOpen, setTemplateDialogOpen] = useState(false)
   const [editingBudget, setEditingBudget] = useState<BudgetProgress | null>(null)
+  const [editingTemplate, setEditingTemplate] = useState<BudgetTemplate | null>(null)
   const [pendingDeleteBudget, setPendingDeleteBudget] = useState<BudgetProgress | null>(null)
 
   useEffect(() => {
@@ -35,9 +40,14 @@ export function BudgetsPage() {
   }, [month])
 
   async function loadBudgets() {
-    const [budgets, appSettings] = await Promise.all([ipc.getBudgets(month), ipc.getSettings()])
+    const [budgets, appSettings, budgetTemplates] = await Promise.all([
+      ipc.getBudgets(month),
+      ipc.getSettings(),
+      ipc.getBudgetTemplates(),
+    ])
     setPayload(budgets)
     setSettings(appSettings)
+    setTemplates(budgetTemplates)
   }
 
   async function saveBudget(budget: BudgetInput) {
@@ -51,6 +61,27 @@ export function BudgetsPage() {
     setPendingDeleteBudget(null)
   }
 
+  async function saveBudgetTemplate(template: BudgetTemplateInput) {
+    await ipc.saveBudgetTemplate(template)
+    await loadBudgets()
+  }
+
+  async function removeTemplate(template: BudgetTemplate) {
+    await ipc.deleteBudgetTemplate(template.id)
+    await loadBudgets()
+  }
+
+  async function applyTemplates() {
+    const next = await ipc.applyBudgetTemplates(month)
+    setPayload(next)
+    setTemplates(await ipc.getBudgetTemplates())
+  }
+
+  async function saveMonthAsTemplates() {
+    await ipc.saveMonthAsBudgetTemplates(month)
+    await loadBudgets()
+  }
+
   const currency = settings?.currency ?? 'USD'
 
   return (
@@ -59,7 +90,7 @@ export function BudgetsPage() {
         title="Budgets"
         description="Set monthly limits per category and watch them update automatically against live spending."
         action={
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             <input
               aria-label="Budget month"
               className="focus-ring rounded-xl border border-input bg-background px-3 py-2 text-sm"
@@ -67,6 +98,15 @@ export function BudgetsPage() {
               value={month}
               onChange={(event) => setMonth(event.target.value)}
             />
+            <Button
+              variant="outline"
+              onClick={() => {
+                setEditingTemplate(null)
+                setTemplateDialogOpen(true)
+              }}
+            >
+              Budget template
+            </Button>
             <Button
               onClick={() => {
                 setEditingBudget(null)
@@ -108,8 +148,7 @@ export function BudgetsPage() {
                     {payload.overview.totalBudget > 0 ? payload.overview.percentage.toFixed(0) : '0'}%
                   </p>
                   <p className="text-sm text-muted-foreground">
-                    {formatCurrency(payload.overview.totalSpent, currency)} spent of{' '}
-                    {formatCurrency(payload.overview.totalBudget, currency)}
+                    {formatCurrency(payload.overview.totalSpent, currency)} spent of {formatCurrency(payload.overview.totalBudget, currency)}
                   </p>
                 </div>
                 <Badge variant={payload.overview.percentage >= 100 ? 'destructive' : 'secondary'}>
@@ -177,10 +216,75 @@ export function BudgetsPage() {
               action={<Button onClick={() => setDialogOpen(true)}>Create first budget</Button>}
             />
           )}
+
+          <Card className="border-border/80 bg-card/90">
+            <CardHeader>
+              <div className="flex flex-wrap items-center justify-between gap-4">
+                <div>
+                  <CardTitle>Budget templates</CardTitle>
+                  <CardDescription>Reusable category caps that can auto-fill a new month without overwriting anything already set.</CardDescription>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button variant="outline" onClick={() => void applyTemplates()}>
+                    Use templates for {month}
+                  </Button>
+                  <Button variant="outline" onClick={() => void saveMonthAsTemplates()}>
+                    Save {month} as templates
+                  </Button>
+                  <Button
+                    onClick={() => {
+                      setEditingTemplate(null)
+                      setTemplateDialogOpen(true)
+                    }}
+                  >
+                    Add template
+                  </Button>
+                </div>
+              </div>
+            </CardHeader>
+            <CardContent className="grid gap-3">
+              {templates.length ? (
+                templates.map((template) => (
+                  <div key={template.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border/80 bg-muted/20 px-4 py-3">
+                    <div>
+                      <p className="font-medium text-foreground">{template.category}</p>
+                      <p className="text-sm text-muted-foreground">{formatCurrency(template.amount, currency)}</p>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge variant={template.active ? 'secondary' : 'outline'}>{template.active ? 'Active' : 'Paused'}</Badge>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => {
+                          setEditingTemplate(template)
+                          setTemplateDialogOpen(true)
+                        }}
+                      >
+                        Edit
+                      </Button>
+                      <Button variant="ghost" size="sm" onClick={() => void removeTemplate(template)}>
+                        Delete
+                      </Button>
+                    </div>
+                  </div>
+                ))
+              ) : (
+                <EmptyState title="No budget templates yet" description="Create a few reusable templates to prefill future months." />
+              )}
+            </CardContent>
+          </Card>
         </>
       ) : (
         <Card className="border-border/80 bg-card/90">
-          <CardContent className="pt-6 text-muted-foreground">Loading Budgets…</CardContent>
+          <CardHeader>
+            <CardTitle>Loading budgets</CardTitle>
+            <CardDescription>Preparing this month&apos;s budgets and templates.</CardDescription>
+          </CardHeader>
+          <CardContent className="grid gap-4">
+            <Skeleton className="h-28 rounded-3xl" />
+            <Skeleton className="h-24 rounded-3xl" />
+            <Skeleton className="h-24 rounded-3xl" />
+          </CardContent>
         </Card>
       )}
 
@@ -193,6 +297,16 @@ export function BudgetsPage() {
           if (!open) setEditingBudget(null)
         }}
         onSubmit={saveBudget}
+      />
+
+      <BudgetTemplateDialog
+        open={templateDialogOpen}
+        template={editingTemplate}
+        onOpenChange={(open) => {
+          setTemplateDialogOpen(open)
+          if (!open) setEditingTemplate(null)
+        }}
+        onSubmit={saveBudgetTemplate}
       />
 
       <AlertDialog open={Boolean(pendingDeleteBudget)} onOpenChange={(open) => !open && setPendingDeleteBudget(null)}>

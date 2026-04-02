@@ -2,7 +2,9 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { CATEGORY_COLORS, DEFAULT_SETTINGS, SETTINGS_KEYS } from '../shared/constants'
+import { BUDGET_CATEGORIES, CATEGORY_COLORS, DEFAULT_SETTINGS, SETTINGS_KEYS } from '../shared/constants'
+import { normalizeFreeformText, normalizePayee } from '../shared/payees'
+import { sanitizeSettingsForSnapshot } from '../shared/snapshot'
 import type {
   AICacheSnapshotEntry,
   AnalyticsData,
@@ -11,23 +13,77 @@ import type {
   Budget,
   BudgetInput,
   BudgetProgress,
+  BudgetTemplate,
+  BudgetTemplateInput,
   BudgetsPayload,
   CategorySpendDatum,
   CategoryTrendDatum,
+  CsvImportCommitSummary,
+  CsvImportPreviewRequest,
+  CsvImportPreviewResult,
+  CsvImportPreviewRow,
   DashboardData,
+  PayeeRule,
+  PayeeRuleInput,
   Period,
+  RecurringSyncSummary,
+  RecurringTransaction,
+  RecurringTransactionInput,
   SummaryCardData,
   TopExpenseDatum,
   Transaction,
   TransactionFilters,
   TransactionInput,
   TransactionSortField,
+  TransactionType,
   TrendDatum,
 } from '../shared/types'
+import { parseCsv, readCsvFile } from './csv'
 
 type SettingsRow = { key: keyof AppSettings; value: string }
 type BudgetRow = { id: string; category: string; amount: number; month: string }
 type CacheRow = { key: string; payload: string; created_at: string }
+type TransactionRow = {
+  id: string
+  amount: number
+  type: TransactionType
+  category: string
+  payee: string | null
+  date: string
+  note: string | null
+  recurring_transaction_id: string | null
+  created_at: string
+}
+type RecurringTransactionRow = {
+  id: string
+  payee: string
+  amount: number
+  type: TransactionType
+  category: string
+  note: string | null
+  day_of_month: number
+  start_month: string
+  last_posted_month: string | null
+  active: number
+  created_at: string
+  updated_at: string
+}
+type BudgetTemplateRow = {
+  id: string
+  category: string
+  amount: number
+  active: number
+  created_at: string
+  updated_at: string
+}
+type PayeeRuleRow = {
+  id: string
+  normalized_payee: string
+  payee_display: string
+  category: string
+  created_at: string
+  updated_at: string
+}
 
 interface PeriodBucket {
   label: string
@@ -44,6 +100,10 @@ export class DatabaseManager {
     this.db.pragma('journal_mode = WAL')
     this.db.pragma('foreign_keys = ON')
     this.initialize()
+  }
+
+  close() {
+    this.db.close()
   }
 
   private initialize() {
@@ -76,7 +136,41 @@ export class DatabaseManager {
         payload TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS recurring_transactions (
+        id TEXT PRIMARY KEY,
+        payee TEXT NOT NULL,
+        amount REAL NOT NULL CHECK(amount > 0),
+        type TEXT NOT NULL CHECK(type IN ('income', 'expense')),
+        category TEXT NOT NULL,
+        note TEXT,
+        day_of_month INTEGER NOT NULL CHECK(day_of_month >= 1 AND day_of_month <= 31),
+        start_month TEXT NOT NULL,
+        last_posted_month TEXT,
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS budget_templates (
+        id TEXT PRIMARY KEY,
+        category TEXT NOT NULL UNIQUE,
+        amount REAL NOT NULL CHECK(amount > 0),
+        active INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS payee_rules (
+        id TEXT PRIMARY KEY,
+        normalized_payee TEXT NOT NULL UNIQUE,
+        payee_display TEXT NOT NULL,
+        category TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
     `)
+    this.migrateTransactionsTable()
     this.seedDefaultSettings()
   }
 
@@ -110,11 +204,13 @@ export class DatabaseManager {
   }
 
   getTransactions(filters: TransactionFilters = {}): Transaction[] {
+    this.syncRecurringTransactions()
+
     const clauses: string[] = []
     const params: Record<string, unknown> = {}
 
     if (filters.search) {
-      clauses.push('(LOWER(category) LIKE @search OR LOWER(COALESCE(note, \'\')) LIKE @search)')
+      clauses.push('(LOWER(category) LIKE @search OR LOWER(COALESCE(note, \'\')) LIKE @search OR LOWER(COALESCE(payee, \'\')) LIKE @search)')
       params.search = `%${filters.search.toLowerCase()}%`
     }
 
@@ -154,54 +250,19 @@ export class DatabaseManager {
     const rows = this.db
       .prepare(
         `
-          SELECT id, amount, type, category, date, note, created_at
+          SELECT id, amount, type, category, payee, date, note, recurring_transaction_id, created_at
           FROM transactions
           ${where}
           ORDER BY ${sortColumn} ${sortDirection}, created_at DESC
         `,
       )
-      .all(params) as Array<{
-      id: string
-      amount: number
-      type: 'income' | 'expense'
-      category: string
-      date: string
-      note: string | null
-      created_at: string
-    }>
+      .all(params) as TransactionRow[]
 
-    return rows.map((row) => ({
-      id: row.id,
-      amount: row.amount,
-      type: row.type,
-      category: row.category,
-      date: row.date,
-      note: row.note,
-      createdAt: row.created_at,
-    }))
+    return rows.map(mapTransactionRow)
   }
 
   addTransaction(input: TransactionInput): Transaction {
-    const transaction: Transaction = {
-      id: randomUUID(),
-      amount: input.amount,
-      type: input.type,
-      category: input.category,
-      date: input.date,
-      note: input.note?.trim() || null,
-      createdAt: new Date().toISOString(),
-    }
-
-    this.db
-      .prepare(
-        `
-        INSERT INTO transactions(id, amount, type, category, date, note, created_at)
-        VALUES (@id, @amount, @type, @category, @date, @note, @createdAt)
-      `,
-      )
-      .run(transaction)
-
-    return transaction
+    return this.insertTransaction(input)
   }
 
   updateTransaction(id: string, input: TransactionInput): Transaction {
@@ -212,6 +273,7 @@ export class DatabaseManager {
         SET amount = @amount,
             type = @type,
             category = @category,
+            payee = @payee,
             date = @date,
             note = @note
         WHERE id = @id
@@ -222,39 +284,22 @@ export class DatabaseManager {
         amount: input.amount,
         type: input.type,
         category: input.category,
+        payee: input.payee?.trim() || null,
         date: input.date,
         note: input.note?.trim() || null,
       })
 
     const row = this.db
       .prepare(`
-        SELECT id, amount, type, category, date, note, created_at
+        SELECT id, amount, type, category, payee, date, note, recurring_transaction_id, created_at
         FROM transactions
         WHERE id = ?
       `)
-      .get(id) as
-      | {
-          id: string
-          amount: number
-          type: 'income' | 'expense'
-          category: string
-          date: string
-          note: string | null
-          created_at: string
-        }
-      | undefined
+      .get(id) as TransactionRow | undefined
 
     if (!row) throw new Error('Transaction not found.')
 
-    return {
-      id: row.id,
-      amount: row.amount,
-      type: row.type,
-      category: row.category,
-      date: row.date,
-      note: row.note,
-      createdAt: row.created_at,
-    }
+    return mapTransactionRow(row)
   }
 
   deleteTransactions(ids: string[]) {
@@ -267,6 +312,8 @@ export class DatabaseManager {
   }
 
   getBudgets(month: string): BudgetsPayload {
+    this.applyBudgetTemplates(month)
+
     const budgets = this.getBudgetRows(month)
     const spends = this.getExpensesByCategory(month)
     const progress = budgets.map((budget) => toBudgetProgress(budget, spends.get(budget.category) ?? 0))
@@ -308,6 +355,410 @@ export class DatabaseManager {
     return this.getBudgets(month)
   }
 
+  getBudgetTemplates(): BudgetTemplate[] {
+    return this.getAllBudgetTemplateRows()
+  }
+
+  saveBudgetTemplate(input: BudgetTemplateInput): BudgetTemplate {
+    const now = new Date().toISOString()
+
+    if (input.id) {
+      this.db
+        .prepare(`
+          UPDATE budget_templates
+          SET category = @category,
+              amount = @amount,
+              active = @active,
+              updated_at = @updatedAt
+          WHERE id = @id
+        `)
+        .run({
+          id: input.id,
+          category: input.category,
+          amount: input.amount,
+          active: input.active ? 1 : 0,
+          updatedAt: now,
+        })
+    } else {
+      const existing = this.db
+        .prepare('SELECT id FROM budget_templates WHERE category = ?')
+        .get(input.category) as { id: string } | undefined
+
+      if (existing) {
+        this.db
+          .prepare(`
+            UPDATE budget_templates
+            SET amount = @amount,
+                active = @active,
+                updated_at = @updatedAt
+            WHERE id = @id
+          `)
+          .run({
+            id: existing.id,
+            amount: input.amount,
+            active: input.active ? 1 : 0,
+            updatedAt: now,
+          })
+      } else {
+        this.db
+          .prepare(`
+            INSERT INTO budget_templates(id, category, amount, active, created_at, updated_at)
+            VALUES (@id, @category, @amount, @active, @createdAt, @updatedAt)
+          `)
+          .run({
+            id: randomUUID(),
+            category: input.category,
+            amount: input.amount,
+            active: input.active ? 1 : 0,
+            createdAt: now,
+            updatedAt: now,
+          })
+      }
+    }
+
+    const row = this.db
+      .prepare('SELECT id, category, amount, active, created_at, updated_at FROM budget_templates WHERE category = ?')
+      .get(input.category) as BudgetTemplateRow | undefined
+
+    if (!row) {
+      throw new Error('Budget template could not be saved.')
+    }
+
+    return mapBudgetTemplateRow(row)
+  }
+
+  deleteBudgetTemplate(id: string) {
+    this.db.prepare('DELETE FROM budget_templates WHERE id = ?').run(id)
+  }
+
+  applyBudgetTemplates(month: string): BudgetsPayload {
+    const templates = this.db
+      .prepare('SELECT id, category, amount, active, created_at, updated_at FROM budget_templates WHERE active = 1 ORDER BY category ASC')
+      .all() as BudgetTemplateRow[]
+
+    this.db.transaction(() => {
+      for (const template of templates) {
+        const existing = this.db
+          .prepare('SELECT id FROM budgets WHERE category = ? AND month = ?')
+          .get(template.category, month) as { id: string } | undefined
+
+        if (!existing) {
+          this.db
+            .prepare('INSERT INTO budgets(id, category, amount, month) VALUES (?, ?, ?, ?)')
+            .run(randomUUID(), template.category, template.amount, month)
+        }
+      }
+    })()
+
+    return this.getBudgetsWithoutApplying(month)
+  }
+
+  saveMonthAsBudgetTemplates(month: string): BudgetTemplate[] {
+    const budgets = this.getBudgetRows(month)
+    const now = new Date().toISOString()
+
+    this.db.transaction(() => {
+      this.db.prepare('DELETE FROM budget_templates').run()
+      const insert = this.db.prepare(`
+        INSERT INTO budget_templates(id, category, amount, active, created_at, updated_at)
+        VALUES (@id, @category, @amount, 1, @createdAt, @updatedAt)
+      `)
+
+      for (const budget of budgets) {
+        insert.run({
+          id: randomUUID(),
+          category: budget.category,
+          amount: budget.amount,
+          createdAt: now,
+          updatedAt: now,
+        })
+      }
+    })()
+
+    return this.getBudgetTemplates()
+  }
+
+  getRecurringTransactions(): RecurringTransaction[] {
+    return this.getAllRecurringTransactionRows()
+  }
+
+  saveRecurringTransaction(input: RecurringTransactionInput): RecurringTransaction {
+    const now = new Date().toISOString()
+    const payload = {
+      id: input.id ?? randomUUID(),
+      payee: input.payee.trim(),
+      amount: input.amount,
+      type: input.type,
+      category: input.category,
+      note: input.note?.trim() || null,
+      dayOfMonth: input.dayOfMonth,
+      startMonth: input.startMonth,
+      active: input.active ? 1 : 0,
+      updatedAt: now,
+    }
+
+    if (input.id) {
+      this.db
+        .prepare(`
+          UPDATE recurring_transactions
+          SET payee = @payee,
+              amount = @amount,
+              type = @type,
+              category = @category,
+              note = @note,
+              day_of_month = @dayOfMonth,
+              start_month = @startMonth,
+              active = @active,
+              updated_at = @updatedAt
+          WHERE id = @id
+        `)
+        .run(payload)
+    } else {
+      this.db
+        .prepare(`
+          INSERT INTO recurring_transactions(
+            id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+          )
+          VALUES (@id, @payee, @amount, @type, @category, @note, @dayOfMonth, @startMonth, NULL, @active, @updatedAt, @updatedAt)
+        `)
+        .run(payload)
+    }
+
+    const row = this.db
+      .prepare(`
+        SELECT id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        FROM recurring_transactions
+        WHERE id = ?
+      `)
+      .get(payload.id) as RecurringTransactionRow | undefined
+
+    if (!row) {
+      throw new Error('Recurring transaction could not be saved.')
+    }
+
+    return mapRecurringTransactionRow(row)
+  }
+
+  deleteRecurringTransaction(id: string) {
+    this.db.prepare('DELETE FROM recurring_transactions WHERE id = ?').run(id)
+  }
+
+  syncRecurringTransactions(referenceDate = new Date()): RecurringSyncSummary {
+    const month = `${referenceDate.getUTCFullYear()}-${String(referenceDate.getUTCMonth() + 1).padStart(2, '0')}`
+    const day = referenceDate.getUTCDate()
+    const recurringTransactions = this.db
+      .prepare(`
+        SELECT id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        FROM recurring_transactions
+        WHERE active = 1
+        ORDER BY created_at ASC
+      `)
+      .all() as RecurringTransactionRow[]
+
+    let createdCount = 0
+
+    this.db.transaction(() => {
+      for (const recurring of recurringTransactions) {
+        if (month < recurring.start_month || recurring.last_posted_month === month || day < recurring.day_of_month) {
+          continue
+        }
+
+        const transactionDate = getRecurringDateForMonth(month, recurring.day_of_month)
+        const existing = this.db
+          .prepare('SELECT id FROM transactions WHERE recurring_transaction_id = ? AND date = ?')
+          .get(recurring.id, transactionDate) as { id: string } | undefined
+
+        if (!existing) {
+          this.insertTransaction(
+            {
+              amount: recurring.amount,
+              type: recurring.type,
+              category: recurring.category,
+              payee: recurring.payee,
+              date: transactionDate,
+              note: recurring.note ?? '',
+            },
+            recurring.id,
+          )
+          createdCount += 1
+        }
+
+        this.db
+          .prepare('UPDATE recurring_transactions SET last_posted_month = ?, updated_at = ? WHERE id = ?')
+          .run(month, new Date().toISOString(), recurring.id)
+      }
+    })()
+
+    return { month, createdCount }
+  }
+
+  getPayeeRules(search = ''): PayeeRule[] {
+    const query = search.trim().toLowerCase()
+    const rows = query
+      ? (this.db
+          .prepare(`
+            SELECT id, normalized_payee, payee_display, category, created_at, updated_at
+            FROM payee_rules
+            WHERE LOWER(payee_display) LIKE ?
+            ORDER BY payee_display ASC
+          `)
+          .all(`%${query}%`) as PayeeRuleRow[])
+      : (this.db
+          .prepare(`
+            SELECT id, normalized_payee, payee_display, category, created_at, updated_at
+            FROM payee_rules
+            ORDER BY payee_display ASC
+          `)
+          .all() as PayeeRuleRow[])
+
+    return rows.map(mapPayeeRuleRow)
+  }
+
+  upsertPayeeRule(input: PayeeRuleInput): PayeeRule {
+    const payee = input.payee.trim()
+    const normalized = normalizePayee(payee)
+
+    if (!normalized) {
+      throw new Error('Payee cannot be empty.')
+    }
+
+    const now = new Date().toISOString()
+    const existing = this.db
+      .prepare('SELECT id FROM payee_rules WHERE normalized_payee = ?')
+      .get(normalized) as { id: string } | undefined
+
+    if (existing) {
+      this.db
+        .prepare('UPDATE payee_rules SET payee_display = ?, category = ?, updated_at = ? WHERE id = ?')
+        .run(payee, input.category, now, existing.id)
+    } else {
+      this.db
+        .prepare(`
+          INSERT INTO payee_rules(id, normalized_payee, payee_display, category, created_at, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+        `)
+        .run(randomUUID(), normalized, payee, input.category, now, now)
+    }
+
+    const row = this.db
+      .prepare(`
+        SELECT id, normalized_payee, payee_display, category, created_at, updated_at
+        FROM payee_rules
+        WHERE normalized_payee = ?
+      `)
+      .get(normalized) as PayeeRuleRow | undefined
+
+    if (!row) {
+      throw new Error('Payee rule could not be saved.')
+    }
+
+    return mapPayeeRuleRow(row)
+  }
+
+  deletePayeeRule(id: string) {
+    this.db.prepare('DELETE FROM payee_rules WHERE id = ?').run(id)
+  }
+
+  findPayeeRule(payee: string): PayeeRule | null {
+    const normalized = normalizePayee(payee)
+    if (!normalized) {
+      return null
+    }
+
+    const row = this.db
+      .prepare(`
+        SELECT id, normalized_payee, payee_display, category, created_at, updated_at
+        FROM payee_rules
+        WHERE normalized_payee = ?
+      `)
+      .get(normalized) as PayeeRuleRow | undefined
+
+    return row ? mapPayeeRuleRow(row) : null
+  }
+
+  previewTransactionCsvImport(request: CsvImportPreviewRequest): CsvImportPreviewResult {
+    const { fileName, headers, rows } = readCsvPreviewFile(request.filePath)
+    const signatures = new Set(this.getTransactions().map((transaction) => buildTransactionSignature(transaction)))
+
+    const previewRows = rows.map((values, index) => {
+      const source = buildCsvSource(headers, values)
+      const parsed = this.parseCsvRow(source, request)
+
+      if (!parsed.transaction) {
+        return {
+          rowNumber: index + 2,
+          status: 'invalid',
+          errors: parsed.errors,
+          source,
+          transaction: null,
+        } satisfies CsvImportPreviewRow
+      }
+
+      const signature = buildTransactionSignature(parsed.transaction)
+      if (signatures.has(signature)) {
+        return {
+          rowNumber: index + 2,
+          status: 'duplicate',
+          errors: [],
+          source,
+          transaction: parsed.transaction,
+        } satisfies CsvImportPreviewRow
+      }
+
+      signatures.add(signature)
+
+      return {
+        rowNumber: index + 2,
+        status: parsed.status,
+        errors: [],
+        source,
+        transaction: parsed.transaction,
+      } satisfies CsvImportPreviewRow
+    })
+
+    return { fileName, rows: previewRows }
+  }
+
+  commitTransactionCsvImport(request: CsvImportPreviewRequest): CsvImportCommitSummary {
+    const preview = this.previewTransactionCsvImport(request)
+    let insertedCount = 0
+    let skippedDuplicateCount = 0
+    let invalidCount = 0
+    const learnedRules = new Set<string>()
+
+    this.db.transaction(() => {
+      for (const row of preview.rows) {
+        if (row.status === 'duplicate') {
+          skippedDuplicateCount += 1
+          continue
+        }
+
+        if (row.status === 'invalid' || !row.transaction) {
+          invalidCount += 1
+          continue
+        }
+
+        this.insertTransaction(row.transaction)
+        insertedCount += 1
+
+        if (request.learnRules && row.transaction.payee?.trim()) {
+          this.upsertPayeeRule({
+            payee: row.transaction.payee,
+            category: row.transaction.category,
+          })
+          learnedRules.add(normalizePayee(row.transaction.payee))
+        }
+      }
+    })()
+
+    return {
+      insertedCount,
+      skippedDuplicateCount,
+      invalidCount,
+      learnedRuleCount: learnedRules.size,
+    }
+  }
+
   getDashboardData(period: Period): DashboardData {
     const currentPeriod = getCurrentPeriod(period)
     const transactions = this.getTransactionsInRange(currentPeriod.start, currentPeriod.end)
@@ -338,6 +789,7 @@ export class DatabaseManager {
         .map<TopExpenseDatum>((transaction) => ({
           id: transaction.id,
           category: transaction.category,
+          payee: transaction.payee,
           note: transaction.note,
           date: transaction.date,
           amount: transaction.amount,
@@ -383,12 +835,18 @@ export class DatabaseManager {
       })
   }
 
-  exportAppState(): Pick<AppSnapshotPayload, 'settings' | 'transactions' | 'budgets' | 'aiCache'> {
+  exportAppState(): Pick<
+    AppSnapshotPayload,
+    'settings' | 'transactions' | 'budgets' | 'aiCache' | 'recurringTransactions' | 'budgetTemplates' | 'payeeRules'
+  > {
     return {
-      settings: this.getSettings(),
+      settings: sanitizeSettingsForSnapshot(this.getSettings()),
       transactions: this.getTransactions(),
       budgets: this.getAllBudgetRows(),
       aiCache: this.getAllCacheRows(),
+      recurringTransactions: this.getAllRecurringTransactionRows(),
+      budgetTemplates: this.getAllBudgetTemplateRows(),
+      payeeRules: this.getAllPayeeRuleRows(),
     }
   }
 
@@ -397,19 +855,30 @@ export class DatabaseManager {
       this.db.prepare('DELETE FROM transactions').run()
       this.db.prepare('DELETE FROM budgets').run()
       this.db.prepare('DELETE FROM ai_cache').run()
+      this.db.prepare('DELETE FROM recurring_transactions').run()
+      this.db.prepare('DELETE FROM budget_templates').run()
+      this.db.prepare('DELETE FROM payee_rules').run()
     })()
   }
 
-  replaceAppState(snapshot: Pick<AppSnapshotPayload, 'settings' | 'transactions' | 'budgets' | 'aiCache'>) {
+  replaceAppState(
+    snapshot: Pick<
+      AppSnapshotPayload,
+      'settings' | 'transactions' | 'budgets' | 'aiCache' | 'recurringTransactions' | 'budgetTemplates' | 'payeeRules'
+    >,
+  ) {
     const replace = this.db.transaction(() => {
       this.db.prepare('DELETE FROM transactions').run()
       this.db.prepare('DELETE FROM budgets').run()
       this.db.prepare('DELETE FROM ai_cache').run()
+      this.db.prepare('DELETE FROM recurring_transactions').run()
+      this.db.prepare('DELETE FROM budget_templates').run()
+      this.db.prepare('DELETE FROM payee_rules').run()
       this.db.prepare('DELETE FROM settings').run()
 
       const transactionInsert = this.db.prepare(`
-        INSERT INTO transactions(id, amount, type, category, date, note, created_at)
-        VALUES (@id, @amount, @type, @category, @date, @note, @createdAt)
+        INSERT INTO transactions(id, amount, type, category, payee, date, note, recurring_transaction_id, created_at)
+        VALUES (@id, @amount, @type, @category, @payee, @date, @note, @recurringTransactionId, @createdAt)
       `)
       const budgetInsert = this.db.prepare(`
         INSERT INTO budgets(id, category, amount, month)
@@ -418,6 +887,18 @@ export class DatabaseManager {
       const cacheInsert = this.db.prepare(`
         INSERT INTO ai_cache(key, payload, created_at)
         VALUES (@key, @payload, @createdAt)
+      `)
+      const recurringInsert = this.db.prepare(`
+        INSERT INTO recurring_transactions(id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at)
+        VALUES (@id, @payee, @amount, @type, @category, @note, @dayOfMonth, @startMonth, @lastPostedMonth, @active, @createdAt, @updatedAt)
+      `)
+      const budgetTemplateInsert = this.db.prepare(`
+        INSERT INTO budget_templates(id, category, amount, active, created_at, updated_at)
+        VALUES (@id, @category, @amount, @active, @createdAt, @updatedAt)
+      `)
+      const payeeRuleInsert = this.db.prepare(`
+        INSERT INTO payee_rules(id, normalized_payee, payee_display, category, created_at, updated_at)
+        VALUES (@id, @normalizedPayee, @payeeDisplay, @category, @createdAt, @updatedAt)
       `)
       const settingsInsert = this.db.prepare(`
         INSERT INTO settings(key, value)
@@ -430,8 +911,10 @@ export class DatabaseManager {
           amount: transaction.amount,
           type: transaction.type,
           category: transaction.category,
+          payee: transaction.payee,
           date: transaction.date,
           note: transaction.note,
+          recurringTransactionId: transaction.recurringTransactionId,
           createdAt: transaction.createdAt,
         })
       }
@@ -442,6 +925,38 @@ export class DatabaseManager {
 
       for (const cacheRow of snapshot.aiCache) {
         cacheInsert.run(cacheRow)
+      }
+
+      for (const recurring of snapshot.recurringTransactions ?? []) {
+        recurringInsert.run({
+          id: recurring.id,
+          payee: recurring.payee,
+          amount: recurring.amount,
+          type: recurring.type,
+          category: recurring.category,
+          note: recurring.note,
+          dayOfMonth: recurring.dayOfMonth,
+          startMonth: recurring.startMonth,
+          lastPostedMonth: recurring.lastPostedMonth,
+          active: recurring.active ? 1 : 0,
+          createdAt: recurring.createdAt,
+          updatedAt: recurring.updatedAt,
+        })
+      }
+
+      for (const template of snapshot.budgetTemplates ?? []) {
+        budgetTemplateInsert.run({
+          id: template.id,
+          category: template.category,
+          amount: template.amount,
+          active: template.active ? 1 : 0,
+          createdAt: template.createdAt,
+          updatedAt: template.updatedAt,
+        })
+      }
+
+      for (const rule of snapshot.payeeRules ?? []) {
+        payeeRuleInsert.run(rule)
       }
 
       const mergedSettings = { ...DEFAULT_SETTINGS, ...snapshot.settings }
@@ -459,13 +974,16 @@ export class DatabaseManager {
       this.db.prepare('DELETE FROM transactions').run()
       this.db.prepare('DELETE FROM budgets').run()
       this.db.prepare('DELETE FROM ai_cache').run()
+      this.db.prepare('DELETE FROM recurring_transactions').run()
+      this.db.prepare('DELETE FROM budget_templates').run()
+      this.db.prepare('DELETE FROM payee_rules').run()
       this.db.prepare('DELETE FROM settings').run()
     })()
     this.seedDefaultSettings()
   }
 
   exportTransactionsCsv() {
-    const header = ['id', 'date', 'category', 'type', 'amount', 'note', 'createdAt']
+    const header = ['id', 'date', 'category', 'type', 'amount', 'payee', 'note', 'createdAt']
     const rows = this.getTransactions().map((transaction) =>
       [
         transaction.id,
@@ -473,6 +991,7 @@ export class DatabaseManager {
         transaction.category,
         transaction.type,
         transaction.amount.toFixed(2),
+        transaction.payee ?? '',
         transaction.note ?? '',
         transaction.createdAt,
       ]
@@ -488,6 +1007,49 @@ export class DatabaseManager {
       from: toDateKey(start),
       to: toDateKey(end),
     })
+  }
+
+  private getBudgetsWithoutApplying(month: string): BudgetsPayload {
+    const budgets = this.getBudgetRows(month)
+    const spends = this.getExpensesByCategory(month)
+    const progress = budgets.map((budget) => toBudgetProgress(budget, spends.get(budget.category) ?? 0))
+    const totalBudget = progress.reduce((sum, item) => sum + item.amount, 0)
+    const totalSpent = progress.reduce((sum, item) => sum + item.spent, 0)
+
+    return {
+      month,
+      budgets: progress.sort((left, right) => right.percentage - left.percentage),
+      overview: {
+        totalBudget,
+        totalSpent,
+        percentage: totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0,
+      },
+    }
+  }
+
+  private insertTransaction(input: TransactionInput, recurringTransactionId: string | null = null): Transaction {
+    const transaction: Transaction = {
+      id: randomUUID(),
+      amount: input.amount,
+      type: input.type,
+      category: input.category,
+      payee: input.payee?.trim() || null,
+      date: input.date,
+      note: input.note?.trim() || null,
+      recurringTransactionId,
+      createdAt: new Date().toISOString(),
+    }
+
+    this.db
+      .prepare(
+        `
+        INSERT INTO transactions(id, amount, type, category, payee, date, note, recurring_transaction_id, created_at)
+        VALUES (@id, @amount, @type, @category, @payee, @date, @note, @recurringTransactionId, @createdAt)
+      `,
+      )
+      .run(transaction)
+
+    return transaction
   }
 
   private getBudgetRows(month: string) {
@@ -512,6 +1074,42 @@ export class DatabaseManager {
       payload: row.payload,
       createdAt: row.created_at,
     }))
+  }
+
+  private getAllRecurringTransactionRows(): RecurringTransaction[] {
+    const rows = this.db
+      .prepare(`
+        SELECT id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        FROM recurring_transactions
+        ORDER BY created_at DESC
+      `)
+      .all() as RecurringTransactionRow[]
+
+    return rows.map(mapRecurringTransactionRow)
+  }
+
+  private getAllBudgetTemplateRows(): BudgetTemplate[] {
+    const rows = this.db
+      .prepare(`
+        SELECT id, category, amount, active, created_at, updated_at
+        FROM budget_templates
+        ORDER BY category ASC
+      `)
+      .all() as BudgetTemplateRow[]
+
+    return rows.map(mapBudgetTemplateRow)
+  }
+
+  private getAllPayeeRuleRows(): PayeeRule[] {
+    const rows = this.db
+      .prepare(`
+        SELECT id, normalized_payee, payee_display, category, created_at, updated_at
+        FROM payee_rules
+        ORDER BY payee_display ASC
+      `)
+      .all() as PayeeRuleRow[]
+
+    return rows.map(mapPayeeRuleRow)
   }
 
   private seedDefaultSettings() {
@@ -571,6 +1169,229 @@ export class DatabaseManager {
       return data
     })
   }
+
+  private migrateTransactionsTable() {
+    if (!this.hasColumn('transactions', 'payee')) {
+      this.db.prepare('ALTER TABLE transactions ADD COLUMN payee TEXT').run()
+    }
+
+    if (!this.hasColumn('transactions', 'recurring_transaction_id')) {
+      this.db.prepare('ALTER TABLE transactions ADD COLUMN recurring_transaction_id TEXT').run()
+    }
+  }
+
+  private hasColumn(tableName: string, columnName: string) {
+    const rows = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>
+    return rows.some((row) => row.name === columnName)
+  }
+
+  private parseCsvRow(
+    source: Record<string, string>,
+    request: CsvImportPreviewRequest,
+  ): { status: CsvImportPreviewRow['status']; errors: string[]; transaction: TransactionInput | null } {
+    const errors: string[] = []
+    const date = parseImportDate(source[request.mapping.date])
+    if (!date) {
+      errors.push('Invalid date')
+    }
+
+    const amountDetails = parseImportAmount(source[request.mapping.amount], request.amountMode, request.defaultExpenseType)
+    if (!amountDetails) {
+      errors.push('Invalid amount')
+    }
+
+    const type = request.mapping.type ? parseImportType(source[request.mapping.type]) : amountDetails?.type ?? null
+    if (!type) {
+      errors.push('Invalid type')
+    }
+
+    if (errors.length > 0 || !date || !amountDetails || !type) {
+      return {
+        status: 'invalid',
+        errors,
+        transaction: null,
+      }
+    }
+
+    const payee = request.mapping.payee ? source[request.mapping.payee]?.trim() : ''
+    const note = request.mapping.note ? source[request.mapping.note]?.trim() : ''
+    const rawCategory = request.mapping.category ? source[request.mapping.category]?.trim() : ''
+    let category = BUDGET_CATEGORIES.includes(rawCategory as (typeof BUDGET_CATEGORIES)[number]) ? rawCategory : ''
+    let status: CsvImportPreviewRow['status'] = 'ready'
+
+    if (!category && payee) {
+      const rule = this.findPayeeRule(payee)
+      if (rule) {
+        category = rule.category
+        status = 'rule-filled'
+      }
+    }
+
+    if (!category) {
+      category = 'Other'
+      status = 'defaulted'
+    }
+
+    return {
+      status,
+      errors: [],
+      transaction: {
+        amount: amountDetails.amount,
+        type,
+        category,
+        payee,
+        date,
+        note,
+      },
+    }
+  }
+}
+
+function mapTransactionRow(row: TransactionRow): Transaction {
+  return {
+    id: row.id,
+    amount: row.amount,
+    type: row.type,
+    category: row.category,
+    payee: row.payee,
+    date: row.date,
+    note: row.note,
+    recurringTransactionId: row.recurring_transaction_id,
+    createdAt: row.created_at,
+  }
+}
+
+function mapRecurringTransactionRow(row: RecurringTransactionRow): RecurringTransaction {
+  return {
+    id: row.id,
+    payee: row.payee,
+    amount: row.amount,
+    type: row.type,
+    category: row.category,
+    note: row.note,
+    dayOfMonth: row.day_of_month,
+    startMonth: row.start_month,
+    lastPostedMonth: row.last_posted_month,
+    active: Boolean(row.active),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function mapBudgetTemplateRow(row: BudgetTemplateRow): BudgetTemplate {
+  return {
+    id: row.id,
+    category: row.category,
+    amount: row.amount,
+    active: Boolean(row.active),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function mapPayeeRuleRow(row: PayeeRuleRow): PayeeRule {
+  return {
+    id: row.id,
+    normalizedPayee: row.normalized_payee,
+    payeeDisplay: row.payee_display,
+    category: row.category,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  }
+}
+
+function readCsvPreviewFile(filePath: string) {
+  const parsed = parseCsv(readCsvFile(filePath))
+  if (!parsed.length) {
+    throw new Error('The selected CSV file is empty.')
+  }
+
+  return {
+    fileName: path.basename(filePath),
+    headers: parsed[0],
+    rows: parsed.slice(1),
+  }
+}
+
+function buildCsvSource(headers: string[], values: string[]) {
+  return headers.reduce<Record<string, string>>((accumulator, header, index) => {
+    accumulator[header] = values[index] ?? ''
+    return accumulator
+  }, {})
+}
+
+function parseImportDate(value: string | undefined) {
+  if (!value?.trim()) {
+    return null
+  }
+
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) {
+    return null
+  }
+
+  return parsed.toISOString().slice(0, 10)
+}
+
+function parseImportAmount(value: string | undefined, mode: CsvImportPreviewRequest['amountMode'], defaultExpenseType: TransactionType) {
+  const normalized = value
+    ?.trim()
+    .replace(/[^\d,.\-]/g, '')
+    .replace(/,(?=\d{3}\b)/g, '')
+    .replace(/,(?=\d{1,2}$)/, '.')
+
+  const parsed = Number(normalized)
+  if (!normalized || Number.isNaN(parsed) || parsed === 0) {
+    return null
+  }
+
+  if (mode === 'signed') {
+    return {
+      amount: Math.abs(parsed),
+      type: parsed < 0 ? 'expense' : 'income',
+    } satisfies { amount: number; type: TransactionType }
+  }
+
+  return {
+    amount: Math.abs(parsed),
+    type: defaultExpenseType,
+  } satisfies { amount: number; type: TransactionType }
+}
+
+function parseImportType(value: string | undefined): TransactionType | null {
+  const normalized = value?.trim().toLowerCase() ?? ''
+
+  if (['expense', 'debit', 'withdrawal', 'payment', 'charge'].includes(normalized)) {
+    return 'expense'
+  }
+
+  if (['income', 'credit', 'deposit', 'refund'].includes(normalized)) {
+    return 'income'
+  }
+
+  return null
+}
+
+function buildTransactionSignature(transaction: {
+  date: string
+  amount: number
+  type: TransactionType
+  payee?: string | null
+  note?: string | null
+}) {
+  return [
+    transaction.date,
+    transaction.type,
+    transaction.amount.toFixed(2),
+    normalizePayee(transaction.payee),
+    normalizeFreeformText(transaction.note),
+  ].join('|')
+}
+
+function getRecurringDateForMonth(month: string, dayOfMonth: number) {
+  const [year, monthIndex] = month.split('-').map(Number)
+  const lastDay = new Date(Date.UTC(year, monthIndex, 0)).getUTCDate()
+  return `${month}-${String(Math.min(dayOfMonth, lastDay)).padStart(2, '0')}`
 }
 
 function buildSummary(transactions: Transaction[], budgetTotal: number): SummaryCardData {
@@ -717,6 +1538,8 @@ function getTransactionSortColumn(sortBy: TransactionSortField | undefined) {
       return 'amount'
     case 'category':
       return 'category'
+    case 'payee':
+      return 'COALESCE(payee, \'\')'
     case 'type':
       return 'type'
     case 'note':

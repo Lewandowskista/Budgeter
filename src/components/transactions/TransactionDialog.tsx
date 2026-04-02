@@ -13,30 +13,31 @@ import {
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
+import { ipc } from '@/lib/ipc'
+import { validateTransactionInput, type ValidationErrors } from '@/lib/validation'
 
 interface TransactionDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   initialValue?: Transaction | null
-  onSubmit: (value: TransactionInput) => Promise<void>
+  onSubmit: (value: TransactionInput, options: { rememberPayeeRule: boolean }) => Promise<void>
 }
 
 const blankTransaction: TransactionInput = {
   amount: 0,
   type: 'expense',
   category: BUDGET_CATEGORIES[0],
+  payee: '',
   date: new Date().toISOString().slice(0, 10),
   note: '',
 }
 
-export function TransactionDialog({
-  open,
-  onOpenChange,
-  initialValue,
-  onSubmit,
-}: TransactionDialogProps) {
+export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }: TransactionDialogProps) {
   const [form, setForm] = useState<TransactionInput>(blankTransaction)
   const [saving, setSaving] = useState(false)
+  const [errors, setErrors] = useState<ValidationErrors>({})
+  const [rememberPayeeRule, setRememberPayeeRule] = useState(false)
+  const [categoryTouched, setCategoryTouched] = useState(false)
 
   useEffect(() => {
     if (initialValue) {
@@ -44,13 +45,19 @@ export function TransactionDialog({
         amount: initialValue.amount,
         type: initialValue.type,
         category: initialValue.category,
+        payee: initialValue.payee ?? '',
         date: initialValue.date,
         note: initialValue.note ?? '',
       })
+      setRememberPayeeRule(false)
+      setCategoryTouched(true)
       return
     }
 
     if (open) {
+      setErrors({})
+      setRememberPayeeRule(false)
+      setCategoryTouched(false)
       setForm({
         ...blankTransaction,
         date: new Date().toISOString().slice(0, 10),
@@ -60,16 +67,36 @@ export function TransactionDialog({
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    setSaving(true)
+    const nextErrors = validateTransactionInput(form)
+    setErrors(nextErrors)
 
+    if (Object.keys(nextErrors).length > 0) {
+      return
+    }
+
+    setSaving(true)
     try {
-      await onSubmit({
-        ...form,
-        amount: Number(form.amount),
-      })
+      await onSubmit(
+        {
+          ...form,
+          amount: Number(form.amount),
+        },
+        { rememberPayeeRule },
+      )
       onOpenChange(false)
     } finally {
       setSaving(false)
+    }
+  }
+
+  async function autoFillCategoryFromPayee() {
+    if (categoryTouched || !form.payee?.trim()) {
+      return
+    }
+
+    const rule = await ipc.findPayeeRule(form.payee)
+    if (rule) {
+      setForm((current) => ({ ...current, category: rule.category }))
     }
   }
 
@@ -109,12 +136,18 @@ export function TransactionDialog({
                 autoComplete="off"
                 required
                 name="amount"
-                min="0"
+                min="0.01"
                 step="0.01"
                 type="number"
                 value={form.amount || ''}
-                onChange={(event) => updateField('amount', Number(event.target.value))}
+                onChange={(event) => {
+                  updateField('amount', Number(event.target.value))
+                  if (errors.amount) {
+                    setErrors((current) => ({ ...current, amount: undefined }))
+                  }
+                }}
               />
+              {errors.amount ? <span className="text-sm text-destructive">{errors.amount}</span> : null}
             </label>
             <label className="grid gap-2 text-sm font-medium text-foreground">
               Date
@@ -129,25 +162,57 @@ export function TransactionDialog({
             </label>
           </div>
 
-          <label className="grid gap-2 text-sm font-medium text-foreground">
-            Category
-            <Select value={form.category} onValueChange={(value) => updateField('category', value)}>
-              <SelectTrigger className="w-full">
-                <SelectValue placeholder="Select a category" />
-              </SelectTrigger>
-              <SelectContent>
-                {BUDGET_CATEGORIES.map((category) => (
-                  <SelectItem key={category} value={category}>
-                    {category}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </label>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <label className="grid gap-2 text-sm font-medium text-foreground">
+              Payee
+              <Input
+                autoComplete="off"
+                name="payee"
+                placeholder="Merchant or source"
+                value={form.payee ?? ''}
+                onBlur={() => void autoFillCategoryFromPayee()}
+                onChange={(event) => updateField('payee', event.target.value)}
+              />
+            </label>
+
+            <label className="grid gap-2 text-sm font-medium text-foreground">
+              Category
+              <Select
+                value={form.category}
+                onValueChange={(value) => {
+                  setCategoryTouched(true)
+                  updateField('category', value)
+                }}
+              >
+                <SelectTrigger className="w-full">
+                  <SelectValue placeholder="Select a category" />
+                </SelectTrigger>
+                <SelectContent>
+                  {BUDGET_CATEGORIES.map((category) => (
+                    <SelectItem key={category} value={category}>
+                      {category}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </label>
+          </div>
+
+          {form.payee?.trim() ? (
+            <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <input
+                checked={rememberPayeeRule}
+                className="focus-ring size-4 rounded border border-input"
+                type="checkbox"
+                onChange={(event) => setRememberPayeeRule(event.target.checked)}
+              />
+              Remember this payee and use the selected category next time.
+            </label>
+          ) : null}
 
           <label className="grid gap-2 text-sm font-medium text-foreground">
             Note
-              <Textarea
+            <Textarea
               name="note"
               rows={4}
               value={form.note}

@@ -5,9 +5,17 @@
   "author": "Stefan",
   "main": "dist-electron/electron/main.js",
   "scripts": {
+    "rebuild:native:electron": "node scripts/rebuild-electron-native.cjs",
+    "rebuild:native:node": "npm rebuild better-sqlite3",
+    "predev": "npm run rebuild:native:electron",
     "dev": "concurrently -k \"vite\" \"tsc -p tsconfig.electron.json --watch --preserveWatchOutput\" \"wait-on tcp:5173 dist-electron/electron/main.js && set ELECTRON_RUN_AS_NODE=&& .\\node_modules\\electron\\dist\\electron.exe .\"",
+    "prebuild": "npm run rebuild:native:electron",
     "build": "vite build && tsc -p tsconfig.electron.json",
     "preview": "vite preview",
+    "test": "node scripts/run-vitest-with-native-rebuild.cjs",
+    "test:vitest": "vitest run",
+    "test:watch": "vitest",
+    "prepackage": "npm run rebuild:native:electron",
     "package": "npm run build && electron-builder"
   },
   "dependencies": {
@@ -30,6 +38,8 @@
     "tw-animate-css": "^1.4.0"
   },
   "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
     "@types/node": "^25.5.0",
     "@types/react": "^18.3.1",
     "@types/react-dom": "^18.3.1",
@@ -37,8 +47,10 @@
     "concurrently": "^9.1.2",
     "electron": "^33.3.1",
     "electron-builder": "^25.1.8",
+    "jsdom": "^29.0.1",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
+    "vitest": "^4.1.2",
     "wait-on": "^9.0.4"
   },
   "build": {

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { AppInfo, AppSettings, AppSnapshotSummary } from '../../shared/types'
+import type { AppInfo, AppSettings, AppSnapshotSummary, PayeeRule } from '../../shared/types'
 import { PageHeader } from '@/components/shared/PageHeader'
 import {
   AlertDialog,
@@ -15,7 +15,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { CURRENCY_OPTIONS } from '@/lib/constants'
+import { CURRENCY_OPTIONS, BUDGET_CATEGORIES } from '@/lib/constants'
 import { ipc } from '@/lib/ipc'
 import { useTheme } from '@/lib/theme'
 
@@ -23,6 +23,8 @@ export function SettingsPage() {
   const [settings, setSettings] = useState<AppSettings | null>(null)
   const [appInfo, setAppInfo] = useState<AppInfo | null>(null)
   const [snapshots, setSnapshots] = useState<AppSnapshotSummary[]>([])
+  const [payeeRules, setPayeeRules] = useState<PayeeRule[]>([])
+  const [payeeRuleSearch, setPayeeRuleSearch] = useState('')
   const [snapshotLabel, setSnapshotLabel] = useState('')
   const [saving, setSaving] = useState(false)
   const [creatingSnapshot, setCreatingSnapshot] = useState(false)
@@ -39,22 +41,36 @@ export function SettingsPage() {
     void loadSettings()
   }, [])
 
+  useEffect(() => {
+    void loadPayeeRules(payeeRuleSearch)
+  }, [payeeRuleSearch])
+
   async function loadSettings() {
-    const [currentSettings, currentAppInfo, currentSnapshots] = await Promise.all([
+    const [currentSettings, currentAppInfo, currentSnapshots, currentPayeeRules] = await Promise.all([
       ipc.getSettings(),
       ipc.getAppInfo(),
       ipc.listSnapshots(),
+      ipc.getPayeeRules(),
     ])
     setSettings(currentSettings)
     setAppInfo(currentAppInfo)
     setSnapshots(currentSnapshots)
+    setPayeeRules(currentPayeeRules)
+  }
+
+  async function loadPayeeRules(search = '') {
+    setPayeeRules(await ipc.getPayeeRules(search))
   }
 
   if (!settings) {
-    return <div className="text-muted-foreground">Loading settings...</div>
+    return <div className="text-muted-foreground">Loading settings…</div>
   }
 
   async function handleSave() {
+    if (!settings) {
+      return
+    }
+
     setSaving(true)
     try {
       const saved = await ipc.updateSettings(settings)
@@ -121,12 +137,22 @@ export function SettingsPage() {
     }
   }
 
+  async function updatePayeeRule(rule: PayeeRule, category: string) {
+    await ipc.upsertPayeeRule({ payee: rule.payeeDisplay, category })
+    await loadPayeeRules(payeeRuleSearch)
+  }
+
+  async function deletePayeeRule(id: string) {
+    await ipc.deletePayeeRule(id)
+    await loadPayeeRules(payeeRuleSearch)
+  }
+
   return (
     <div className="space-y-6">
       <PageHeader
         title="Settings"
         description="Configure local preferences, Gemini access, theme behavior, exports, and recovery actions."
-        action={<Button onClick={handleSave}>{saving ? 'Saving...' : 'Save Settings'}</Button>}
+        action={<Button onClick={handleSave}>{saving ? 'Saving…' : 'Save Settings'}</Button>}
       />
 
       <section className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
@@ -195,7 +221,7 @@ export function SettingsPage() {
                 </Button>
               </div>
               <span className="text-xs font-normal text-muted-foreground">
-                Budgeter now uses free public benchmark data automatically. Only Gemini needs an API key.
+                Budgeter now uses free public benchmark data automatically. Only Gemini needs an API key, and snapshots never include it.
               </span>
             </label>
 
@@ -252,7 +278,7 @@ export function SettingsPage() {
                       onChange={(event) => setSnapshotLabel(event.target.value)}
                     />
                     <Button onClick={() => void handleCreateSnapshot()} disabled={creatingSnapshot}>
-                      {creatingSnapshot ? 'Saving snapshot...' : 'Save snapshot'}
+                      {creatingSnapshot ? 'Saving snapshot…' : 'Save snapshot'}
                     </Button>
                   </div>
                 </div>
@@ -291,12 +317,54 @@ export function SettingsPage() {
               <div className="rounded-2xl border border-destructive/30 bg-destructive/5 px-4 py-3">
                 <p className="font-medium text-foreground">Advanced</p>
                 <p className="mt-1 text-sm text-muted-foreground">
-                  Factory reset also creates an auto snapshot first, then clears transactions, budgets, AI cache, and restores default settings.
+                  Factory reset also creates an auto snapshot first, then clears transactions, budgets, AI cache, recurring templates, budget templates, payee rules, and restores default settings. Recovery snapshots exclude the Gemini API key by design.
                 </p>
                 <Button className="mt-3" variant="destructive" onClick={() => setFactoryResetOpen(true)}>
                   Factory reset
                 </Button>
               </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/80 bg-card/90">
+            <CardHeader>
+              <CardTitle>Payee rules</CardTitle>
+              <CardDescription>Review and adjust local payee-to-category mappings used by manual entry and CSV import.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-3">
+              <Input
+                autoComplete="off"
+                placeholder="Search payees…"
+                value={payeeRuleSearch}
+                onChange={(event) => setPayeeRuleSearch(event.target.value)}
+              />
+              {payeeRules.length ? (
+                payeeRules.map((rule) => (
+                  <div key={rule.id} className="grid gap-3 rounded-2xl border border-border/80 bg-muted/20 px-4 py-3 sm:grid-cols-[1fr_auto_auto] sm:items-center">
+                    <div>
+                      <p className="font-medium text-foreground">{rule.payeeDisplay}</p>
+                      <p className="text-sm text-muted-foreground">{rule.normalizedPayee}</p>
+                    </div>
+                    <Select value={rule.category} onValueChange={(value) => void updatePayeeRule(rule, value)}>
+                      <SelectTrigger className="w-full min-w-[12rem]">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {BUDGET_CATEGORIES.map((category) => (
+                          <SelectItem key={category} value={category}>
+                            {category}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <Button variant="ghost" onClick={() => void deletePayeeRule(rule.id)}>
+                      Delete
+                    </Button>
+                  </div>
+                ))
+              ) : (
+                <p className="text-sm text-muted-foreground">No payee rules match the current search.</p>
+              )}
             </CardContent>
           </Card>
 
@@ -319,18 +387,30 @@ export function SettingsPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>Start fresh with a blank budget?</AlertDialogTitle>
             <AlertDialogDescription>
-              Budgeter will save an automatic snapshot first, then remove transactions, budgets, and cached AI results. Your
-              currency, location, theme, and Gemini API key will stay in place.
+              This removes transactions, budgets, recurring templates, budget templates, payee rules, and AI cache, while keeping your app settings and creating a snapshot first.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              onClick={() => void handleStartFresh()}
-              disabled={recoveryAction === 'start-fresh'}
-            >
-              {recoveryAction === 'start-fresh' ? 'Starting fresh...' : 'Start fresh'}
+            <AlertDialogAction onClick={() => void handleStartFresh()} disabled={recoveryAction === 'start-fresh'}>
+              {recoveryAction === 'start-fresh' ? 'Clearing…' : 'Start fresh'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={factoryResetOpen} onOpenChange={setFactoryResetOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Factory reset this app?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This creates a snapshot first, then wipes all local data and restores default settings. Your Gemini API key is excluded from the snapshot.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => void handleFactoryReset()} disabled={recoveryAction === 'factory-reset'}>
+              {recoveryAction === 'factory-reset' ? 'Resetting…' : 'Factory reset'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -341,16 +421,13 @@ export function SettingsPage() {
           <AlertDialogHeader>
             <AlertDialogTitle>Restore this snapshot?</AlertDialogTitle>
             <AlertDialogDescription>
-              This replaces your current local transactions, budgets, settings, and cached AI results with the selected snapshot.
+              This replaces the current local data with the selected snapshot. Gemini API keys are never restored from snapshots.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => void handleRestoreSnapshot()}
-              disabled={recoveryAction === 'restore'}
-            >
-              {recoveryAction === 'restore' ? 'Restoring...' : 'Restore snapshot'}
+            <AlertDialogAction onClick={() => void handleRestoreSnapshot()} disabled={recoveryAction === 'restore'}>
+              {recoveryAction === 'restore' ? 'Restoring…' : 'Restore snapshot'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -360,40 +437,12 @@ export function SettingsPage() {
         <AlertDialogContent>
           <AlertDialogHeader>
             <AlertDialogTitle>Delete this snapshot?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This only removes the recovery point file. Your current budget data will stay untouched.
-            </AlertDialogDescription>
+            <AlertDialogDescription>This removes the selected recovery point from local storage.</AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
             <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              onClick={() => void handleDeleteSnapshot()}
-              disabled={deletingSnapshotId === deleteTarget?.id}
-            >
-              {deletingSnapshotId === deleteTarget?.id ? 'Deleting...' : 'Delete snapshot'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-
-      <AlertDialog open={factoryResetOpen} onOpenChange={setFactoryResetOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Factory reset Budgeter?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Budgeter will save an automatic snapshot first, then clear transactions, budgets, cached AI results, and reset
-              settings to their defaults.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              onClick={() => void handleFactoryReset()}
-              disabled={recoveryAction === 'factory-reset'}
-            >
-              {recoveryAction === 'factory-reset' ? 'Resetting...' : 'Factory reset'}
+            <AlertDialogAction variant="destructive" onClick={() => void handleDeleteSnapshot()} disabled={deletingSnapshotId === deleteTarget?.id}>
+              {deletingSnapshotId === deleteTarget?.id ? 'Deleting…' : 'Delete snapshot'}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -402,21 +451,19 @@ export function SettingsPage() {
   )
 }
 
-function formatSnapshotTrigger(trigger: AppSnapshotSummary['trigger']) {
-  switch (trigger) {
-    case 'factory-reset':
-      return 'Factory reset snapshot'
-    case 'start-fresh':
-      return 'Fresh start snapshot'
-    case 'manual':
-    default:
-      return 'Manual snapshot'
-  }
+function formatSnapshotDate(value: string) {
+  return new Date(value).toLocaleString()
 }
 
-function formatSnapshotDate(value: string) {
-  return new Intl.DateTimeFormat(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  }).format(new Date(value))
+function formatSnapshotTrigger(trigger: AppSnapshotSummary['trigger']) {
+  switch (trigger) {
+    case 'manual':
+      return 'Manual snapshot'
+    case 'start-fresh':
+      return 'Start fresh'
+    case 'factory-reset':
+      return 'Factory reset'
+    default:
+      return trigger
+  }
 }

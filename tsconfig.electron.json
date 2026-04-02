@@ -13,5 +13,13 @@
     "resolveJsonModule": true,
     "allowSyntheticDefaultImports": true
   },
-  "include": ["electron/**/*.ts", "shared/**/*.ts"]
+  "include": ["electron/**/*.ts", "shared/**/*.ts"],
+  "exclude": [
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "dist/**",
+    "dist-electron/**",
+    ".worktrees/**",
+    "node_modules/**"
+  ]
 }

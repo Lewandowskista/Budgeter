@@ -1,8 +1,9 @@
-export function formatCurrency(amount: number, currency: string) {
-  return new Intl.NumberFormat('en-US', {
+export function formatCurrency(amount: number, currency: string, locale?: string) {
+  return new Intl.NumberFormat(locale, {
     style: 'currency',
     currency,
-    maximumFractionDigits: 0,
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
   }).format(amount)
 }
 
@@ -14,11 +15,9 @@ export function formatCompactPercent(value: number) {
   return `${value.toFixed(0)}%`
 }
 
-export function formatDate(date: string) {
-  return new Intl.DateTimeFormat('en-US', {
-    month: 'short',
-    day: 'numeric',
-    year: 'numeric',
+export function formatDate(date: string, locale?: string) {
+  return new Intl.DateTimeFormat(locale, {
+    dateStyle: 'medium',
   }).format(new Date(`${date}T00:00:00`))
 }
 

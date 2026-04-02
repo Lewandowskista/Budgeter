@@ -2,6 +2,7 @@ import { type ReactNode, useEffect, useState } from 'react'
 import { ArrowDown, ArrowUp, ArrowUpDown, Check, Pencil, Plus, Search, Trash2, X } from 'lucide-react'
 import type {
   AppSettings,
+  RecurringTransaction,
   SortDirection,
   Transaction,
   TransactionFilters,
@@ -11,6 +12,8 @@ import type {
 } from '../../shared/types'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { PageHeader } from '@/components/shared/PageHeader'
+import { CsvImportDialog } from '@/components/transactions/CsvImportDialog'
+import { RecurringTransactionDialog } from '@/components/transactions/RecurringTransactionDialog'
 import { TransactionDialog } from '@/components/transactions/TransactionDialog'
 import {
   AlertDialog,
@@ -22,18 +25,12 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent } from '@/components/ui/card'
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { BUDGET_CATEGORIES } from '@/lib/constants'
 import { formatCurrency, formatDate } from '@/lib/format'
 import { ipc } from '@/lib/ipc'
@@ -49,9 +46,13 @@ export function TransactionsPage() {
   const [filters, setFilters] = useState<TransactionFilters>(defaultFilters)
   const [transactions, setTransactions] = useState<Transaction[]>([])
   const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [recurringTransactions, setRecurringTransactions] = useState<RecurringTransaction[]>([])
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [csvImportOpen, setCsvImportOpen] = useState(false)
+  const [recurringDialogOpen, setRecurringDialogOpen] = useState(false)
   const [selectedIds, setSelectedIds] = useState<string[]>([])
   const [pendingDeleteIds, setPendingDeleteIds] = useState<string[] | null>(null)
+  const [editingRecurring, setEditingRecurring] = useState<RecurringTransaction | null>(null)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editDraft, setEditDraft] = useState<TransactionInput | null>(null)
   const [savingInline, setSavingInline] = useState(false)
@@ -61,14 +62,22 @@ export function TransactionsPage() {
   }, [filters])
 
   async function loadTransactions(nextFilters: TransactionFilters) {
-    const [rows, appSettings] = await Promise.all([ipc.getTransactions(nextFilters), ipc.getSettings()])
+    const [rows, appSettings, recurring] = await Promise.all([
+      ipc.getTransactions(nextFilters),
+      ipc.getSettings(),
+      ipc.getRecurringTransactions(),
+    ])
     setTransactions(rows)
     setSettings(appSettings)
+    setRecurringTransactions(recurring)
     setSelectedIds([])
   }
 
-  async function saveTransaction(transaction: TransactionInput) {
+  async function saveTransaction(transaction: TransactionInput, options: { rememberPayeeRule: boolean }) {
     await ipc.addTransaction(transaction)
+    if (options.rememberPayeeRule && transaction.payee?.trim()) {
+      await ipc.upsertPayeeRule({ payee: transaction.payee, category: transaction.category })
+    }
     await loadTransactions(filters)
   }
 
@@ -78,12 +87,23 @@ export function TransactionsPage() {
     await loadTransactions(filters)
   }
 
+  async function saveRecurringTransaction(recurring: RecurringTransaction) {
+    await ipc.deleteRecurringTransaction(recurring.id)
+    await loadTransactions(filters)
+  }
+
+  async function upsertRecurringTransaction(recurring: Parameters<typeof ipc.saveRecurringTransaction>[0]) {
+    await ipc.saveRecurringTransaction(recurring)
+    await loadTransactions(filters)
+  }
+
   function startInlineEdit(transaction: Transaction) {
     setEditingId(transaction.id)
     setEditDraft({
       amount: transaction.amount,
       type: transaction.type,
       category: transaction.category,
+      payee: transaction.payee ?? '',
       date: transaction.date,
       note: transaction.note ?? '',
     })
@@ -146,10 +166,24 @@ export function TransactionsPage() {
         title="Transactions"
         description="Search, filter, sort, edit, and delete the full ledger. Income lives here too, alongside expenses."
         action={
-          <Button onClick={() => setDialogOpen(true)}>
-            <Plus data-icon="inline-start" />
-            Add Transaction
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" onClick={() => setCsvImportOpen(true)}>
+              Import CSV
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setEditingRecurring(null)
+                setRecurringDialogOpen(true)
+              }}
+            >
+              New recurring
+            </Button>
+            <Button onClick={() => setDialogOpen(true)}>
+              <Plus data-icon="inline-start" />
+              Add Transaction
+            </Button>
+          </div>
         }
       />
 
@@ -163,7 +197,7 @@ export function TransactionsPage() {
                 autoComplete="off"
                 className="pl-10"
                 name="transaction-search"
-                placeholder="Search note or category…"
+                placeholder="Search note, payee, or category…"
                 value={filters.search ?? ''}
                 onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))}
               />
@@ -285,6 +319,7 @@ export function TransactionsPage() {
                   </TableHead>
                   <SortableHead field="date" label="Date" onSort={toggleSort} renderIcon={renderSortIcon} />
                   <SortableHead field="category" label="Category" onSort={toggleSort} renderIcon={renderSortIcon} />
+                  <SortableHead field="payee" label="Payee" onSort={toggleSort} renderIcon={renderSortIcon} />
                   <SortableHead field="note" label="Note" onSort={toggleSort} renderIcon={renderSortIcon} />
                   <SortableHead field="type" label="Type" onSort={toggleSort} renderIcon={renderSortIcon} />
                   <SortableHead field="amount" label="Amount" onSort={toggleSort} renderIcon={renderSortIcon} className="text-right" />
@@ -314,15 +349,7 @@ export function TransactionsPage() {
                       </TableCell>
                       <TableCell>
                         {isEditing ? (
-                          <Input
-                            aria-label="Edit transaction date"
-                            autoComplete="off"
-                            className="h-9"
-                            name={`edit-date-${transaction.id}`}
-                            type="date"
-                            value={editDraft.date}
-                            onChange={(event) => updateEditField('date', event.target.value)}
-                          />
+                          <Input type="date" value={editDraft.date} onChange={(event) => updateEditField('date', event.target.value)} />
                         ) : (
                           formatDate(transaction.date)
                         )}
@@ -342,7 +369,23 @@ export function TransactionsPage() {
                             </SelectContent>
                           </Select>
                         ) : (
-                          transaction.category
+                          <div className="flex items-center gap-2">
+                            <span>{transaction.category}</span>
+                            {transaction.recurringTransactionId ? <Badge variant="outline">Recurring</Badge> : null}
+                          </div>
+                        )}
+                      </TableCell>
+                      <TableCell className="max-w-[14rem] min-w-0">
+                        {isEditing ? (
+                          <Input
+                            aria-label="Edit transaction payee"
+                            autoComplete="off"
+                            className="h-9"
+                            value={editDraft.payee ?? ''}
+                            onChange={(event) => updateEditField('payee', event.target.value)}
+                          />
+                        ) : (
+                          <span className="block truncate text-muted-foreground">{transaction.payee || 'No payee'}</span>
                         )}
                       </TableCell>
                       <TableCell className="max-w-[18rem] min-w-0">
@@ -351,7 +394,6 @@ export function TransactionsPage() {
                             aria-label="Edit transaction note"
                             autoComplete="off"
                             className="h-9"
-                            name={`edit-note-${transaction.id}`}
                             placeholder="Optional note…"
                             value={editDraft.note ?? ''}
                             onChange={(event) => updateEditField('note', event.target.value)}
@@ -382,7 +424,6 @@ export function TransactionsPage() {
                             className="ml-auto h-9 w-28 text-right"
                             inputMode="decimal"
                             min="0"
-                            name={`edit-amount-${transaction.id}`}
                             step="0.01"
                             type="number"
                             value={editDraft.amount}
@@ -434,7 +475,74 @@ export function TransactionsPage() {
         </CardContent>
       </Card>
 
+      <Card className="border-border/80 bg-card/90">
+        <CardHeader>
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <CardTitle>Recurring transactions</CardTitle>
+              <CardDescription>Monthly templates that auto-post when the due day arrives in the current month.</CardDescription>
+            </div>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setEditingRecurring(null)
+                setRecurringDialogOpen(true)
+              }}
+            >
+              Add recurring
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="grid gap-3">
+          {recurringTransactions.length ? (
+            recurringTransactions.map((recurring) => (
+              <div key={recurring.id} className="flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-border/80 bg-muted/20 px-4 py-3">
+                <div className="space-y-1">
+                  <p className="font-medium text-foreground">{recurring.payee}</p>
+                  <p className="text-sm text-muted-foreground">
+                    {formatCurrency(recurring.amount, currency)} · {recurring.category} · day {recurring.dayOfMonth} · starts {recurring.startMonth}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge variant={recurring.active ? 'secondary' : 'outline'}>{recurring.active ? 'Active' : 'Paused'}</Badge>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setEditingRecurring(recurring)
+                      setRecurringDialogOpen(true)
+                    }}
+                  >
+                    Edit
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={() => void saveRecurringTransaction(recurring)}>
+                    Delete
+                  </Button>
+                </div>
+              </div>
+            ))
+          ) : (
+            <EmptyState
+              title="No recurring transactions yet"
+              description="Create monthly templates for rent, subscriptions, or salary so Budgeter can post them automatically."
+            />
+          )}
+        </CardContent>
+      </Card>
+
       <TransactionDialog open={dialogOpen} onOpenChange={setDialogOpen} onSubmit={saveTransaction} />
+      <CsvImportDialog open={csvImportOpen} onOpenChange={setCsvImportOpen} onComplete={() => loadTransactions(filters)} />
+      <RecurringTransactionDialog
+        open={recurringDialogOpen}
+        recurring={editingRecurring}
+        onOpenChange={(open) => {
+          setRecurringDialogOpen(open)
+          if (!open) {
+            setEditingRecurring(null)
+          }
+        }}
+        onSubmit={upsertRecurringTransaction}
+      />
 
       <AlertDialog open={Boolean(pendingDeleteIds)} onOpenChange={(open) => !open && setPendingDeleteIds(null)}>
         <AlertDialogContent>

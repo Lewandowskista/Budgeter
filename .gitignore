@@ -2,6 +2,7 @@ node_modules/
 dist/
 dist-electron/
 .worktrees/
+build/config.gypi
 *.log
 .DS_Store
 .env.local

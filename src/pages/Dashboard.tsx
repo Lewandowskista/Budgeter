@@ -38,6 +38,11 @@ export function DashboardPage() {
   }
 
   const currency = settings?.currency ?? 'USD'
+  const formatTooltipValue = (value: number | string | ReadonlyArray<number | string> | undefined) => {
+    const raw = Array.isArray(value) ? value[0] : value
+    const amount = typeof raw === 'number' ? raw : Number(raw)
+    return formatCurrency(Number.isFinite(amount) ? amount : 0, currency)
+  }
 
   return (
     <div className="space-y-6">
@@ -112,7 +117,7 @@ export function DashboardPage() {
                           <Cell key={entry.category} fill={entry.color} />
                         ))}
                       </Pie>
-                      <Tooltip formatter={(value: number) => formatCurrency(value, currency)} />
+                      <Tooltip formatter={formatTooltipValue} />
                       <Legend />
                     </PieChart>
                   </ResponsiveContainer>
@@ -135,7 +140,7 @@ export function DashboardPage() {
                     <LineChart data={data.spendingTrend}>
                     <XAxis dataKey="label" stroke="var(--color-muted-foreground)" />
                     <YAxis stroke="var(--color-muted-foreground)" />
-                    <Tooltip formatter={(value: number) => formatCurrency(value, currency)} />
+                    <Tooltip formatter={formatTooltipValue} />
                     <Legend />
                     <Line isAnimationActive={!prefersReducedMotion} type="monotone" dataKey="spent" stroke="var(--color-primary)" strokeWidth={3} />
                     <Line isAnimationActive={!prefersReducedMotion} type="monotone" dataKey="income" stroke="var(--color-accent)" strokeWidth={2} />

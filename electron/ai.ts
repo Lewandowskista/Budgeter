@@ -1,6 +1,6 @@
 import { GoogleGenAI } from '@google/genai'
 import { DEFAULT_SETTINGS } from '../shared/constants'
-import type { AIAnalysisResult, AIComparison, AppSettings } from '../shared/types'
+import type { AIAnalysisResult, AIComparison, AppSettings, BenchmarkConfidence } from '../shared/types'
 import type { DatabaseManager } from './database'
 
 const ECB_FX_RATES_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
@@ -79,6 +79,11 @@ interface WteApiDocUpdateDates {
   qualityIndexUpdatedAt: string | null
 }
 
+interface CachedAnalysisRow {
+  payload: string
+  created_at: string
+}
+
 const COUNTRY_ALIASES: Record<string, string> = {
   usa: 'united states',
   'united states of america': 'united states',
@@ -101,6 +106,11 @@ export async function analyzeInsights(
 
   const cacheKey = `${FREE_PROVIDER_VERSION}:${periodMonth}:${settings.city}:${settings.country}:${settings.currency}`
   const cached = database.getCache(cacheKey)
+  const reusableCachedAnalysis = readCachedAnalysis(cached, refresh)
+
+  if (reusableCachedAnalysis) {
+    return reusableCachedAnalysis
+  }
 
   try {
     const snapshot = database.getMonthlySpendingSnapshot(periodMonth)
@@ -128,20 +138,51 @@ export async function analyzeInsights(
       tips: Array.isArray(parsed.tips) ? parsed.tips.filter(isNonEmptyString).slice(0, 5) : [],
       positives: Array.isArray(parsed.positives) ? parsed.positives.filter(isNonEmptyString).slice(0, 5) : [],
       comparisons: baselineComparisons,
+      benchmarkLevel: benchmark.benchmarkLevel,
+      benchmarkConfidence: getBenchmarkConfidence(benchmark.benchmarkLevel),
       benchmarkSummary: benchmark.benchmarkSummary,
       dataSources: benchmark.dataSources,
+      sourceRecency: benchmark.sourceRecency,
       cachedAt: new Date().toISOString(),
     }
 
     database.setCache(cacheKey, result)
     return result
   } catch (error) {
-    if (!refresh && cached && Date.now() - new Date(cached.created_at).getTime() < CACHE_TTL_MS) {
-      return JSON.parse(cached.payload) as AIAnalysisResult
+    if (reusableCachedAnalysis) {
+      return reusableCachedAnalysis
     }
 
     throw error
   }
+}
+
+export function readCachedAnalysis(
+  cached: CachedAnalysisRow | null,
+  refresh: boolean,
+  now = Date.now(),
+): AIAnalysisResult | null {
+  if (refresh || !cached) {
+    return null
+  }
+
+  if (now - new Date(cached.created_at).getTime() >= CACHE_TTL_MS) {
+    return null
+  }
+
+  return JSON.parse(cached.payload) as AIAnalysisResult
+}
+
+export function getBenchmarkConfidence(level: NonNullable<AIAnalysisResult['benchmarkLevel']>): BenchmarkConfidence {
+  if (level === 'city') {
+    return 'high'
+  }
+
+  if (level === 'global') {
+    return 'low'
+  }
+
+  return 'medium'
 }
 
 function validateSettings(settings: AppSettings) {
