@@ -28,6 +28,7 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
   const [amountColumn, setAmountColumn] = useState('')
   const [typeColumn, setTypeColumn] = useState('__none__')
   const [categoryColumn, setCategoryColumn] = useState('__none__')
+  const [incomeSourceColumn, setIncomeSourceColumn] = useState('__none__')
   const [payeeColumn, setPayeeColumn] = useState('__none__')
   const [noteColumn, setNoteColumn] = useState('__none__')
   const [amountMode, setAmountMode] = useState<'signed' | 'absolute'>('signed')
@@ -49,6 +50,7 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
         amount: amountColumn,
         type: typeColumn !== '__none__' ? typeColumn : undefined,
         category: categoryColumn !== '__none__' ? categoryColumn : undefined,
+        incomeSource: incomeSourceColumn !== '__none__' ? incomeSourceColumn : undefined,
         payee: payeeColumn !== '__none__' ? payeeColumn : undefined,
         note: noteColumn !== '__none__' ? noteColumn : undefined,
       },
@@ -56,7 +58,7 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
       defaultExpenseType,
       learnRules,
     }
-  }, [amountColumn, amountMode, categoryColumn, dateColumn, defaultExpenseType, file, learnRules, noteColumn, payeeColumn, typeColumn])
+  }, [amountColumn, amountMode, categoryColumn, dateColumn, defaultExpenseType, file, incomeSourceColumn, learnRules, noteColumn, payeeColumn, typeColumn])
 
   function reset() {
     setStep('choose')
@@ -65,6 +67,7 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
     setAmountColumn('')
     setTypeColumn('__none__')
     setCategoryColumn('__none__')
+    setIncomeSourceColumn('__none__')
     setPayeeColumn('__none__')
     setNoteColumn('__none__')
     setAmountMode('signed')
@@ -145,6 +148,7 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
               <ColumnSelect label="Amount column" headers={file.headers} value={amountColumn} onChange={setAmountColumn} />
               <ColumnSelect label="Type column" headers={file.headers} value={typeColumn} onChange={setTypeColumn} optional />
               <ColumnSelect label="Category column" headers={file.headers} value={categoryColumn} onChange={setCategoryColumn} optional />
+              <ColumnSelect label="Income type column" headers={file.headers} value={incomeSourceColumn} onChange={setIncomeSourceColumn} optional />
               <ColumnSelect label="Payee column" headers={file.headers} value={payeeColumn} onChange={setPayeeColumn} optional />
               <ColumnSelect label="Note column" headers={file.headers} value={noteColumn} onChange={setNoteColumn} optional />
             </div>
@@ -202,6 +206,8 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
                     <TableHead>Status</TableHead>
                     <TableHead>Payee</TableHead>
                     <TableHead>Category</TableHead>
+                    <TableHead>Income Type</TableHead>
+                    <TableHead>Type</TableHead>
                     <TableHead>Amount</TableHead>
                     <TableHead>Errors</TableHead>
                   </TableRow>
@@ -213,6 +219,8 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
                       <TableCell className="capitalize">{row.status}</TableCell>
                       <TableCell>{row.transaction?.payee || '—'}</TableCell>
                       <TableCell>{row.transaction?.category || '—'}</TableCell>
+                      <TableCell>{row.transaction?.incomeSource || '—'}</TableCell>
+                      <TableCell>{row.transaction?.type || '—'}</TableCell>
                       <TableCell>{row.transaction ? row.transaction.amount.toFixed(2) : '—'}</TableCell>
                       <TableCell>{row.errors.join(', ') || '—'}</TableCell>
                     </TableRow>
@@ -240,7 +248,7 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
                 Back to mapping
               </Button>
               <Button disabled={saving} onClick={() => void commit()}>
-                {saving ? 'Importing…' : 'Import transactions'}
+                {saving ? 'Importing...' : 'Import transactions'}
               </Button>
             </>
           ) : null}

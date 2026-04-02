@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { BUDGET_CATEGORIES, CATEGORY_COLORS, DEFAULT_SETTINGS, SETTINGS_KEYS } from '../shared/constants'
+import { BUDGET_CATEGORIES, CATEGORY_COLORS, DEFAULT_SETTINGS, INCOME_SOURCES, SETTINGS_KEYS } from '../shared/constants'
 import { normalizeFreeformText, normalizePayee } from '../shared/payees'
 import { sanitizeSettingsForSnapshot } from '../shared/snapshot'
 import type {
@@ -23,6 +23,7 @@ import type {
   CsvImportPreviewResult,
   CsvImportPreviewRow,
   DashboardData,
+  IncomeSource,
   PayeeRule,
   PayeeRuleInput,
   Period,
@@ -47,7 +48,8 @@ type TransactionRow = {
   id: string
   amount: number
   type: TransactionType
-  category: string
+  category: string | null
+  income_source: IncomeSource | null
   payee: string | null
   date: string
   note: string | null
@@ -59,7 +61,8 @@ type RecurringTransactionRow = {
   payee: string
   amount: number
   type: TransactionType
-  category: string
+  category: string | null
+  income_source: IncomeSource | null
   note: string | null
   day_of_month: number
   start_month: string
@@ -91,6 +94,11 @@ interface PeriodBucket {
   end: Date
 }
 
+interface TableColumnInfo {
+  name: string
+  notnull: number
+}
+
 export class DatabaseManager {
   private readonly db: Database.Database
 
@@ -112,9 +120,12 @@ export class DatabaseManager {
         id TEXT PRIMARY KEY,
         amount REAL NOT NULL CHECK(amount > 0),
         type TEXT NOT NULL CHECK(type IN ('income', 'expense')),
-        category TEXT NOT NULL,
+        category TEXT,
+        income_source TEXT,
+        payee TEXT,
         date TEXT NOT NULL,
         note TEXT,
+        recurring_transaction_id TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
 
@@ -142,7 +153,8 @@ export class DatabaseManager {
         payee TEXT NOT NULL,
         amount REAL NOT NULL CHECK(amount > 0),
         type TEXT NOT NULL CHECK(type IN ('income', 'expense')),
-        category TEXT NOT NULL,
+        category TEXT,
+        income_source TEXT,
         note TEXT,
         day_of_month INTEGER NOT NULL CHECK(day_of_month >= 1 AND day_of_month <= 31),
         start_month TEXT NOT NULL,
@@ -171,6 +183,8 @@ export class DatabaseManager {
       );
     `)
     this.migrateTransactionsTable()
+    this.migrateRecurringTransactionsTable()
+    this.createTransactionIndexes()
     this.seedDefaultSettings()
   }
 
@@ -205,12 +219,17 @@ export class DatabaseManager {
 
   getTransactions(filters: TransactionFilters = {}): Transaction[] {
     this.syncRecurringTransactions()
+    return this.queryTransactions(filters)
+  }
 
+  private queryTransactions(filters: TransactionFilters = {}): Transaction[] {
     const clauses: string[] = []
     const params: Record<string, unknown> = {}
 
     if (filters.search) {
-      clauses.push('(LOWER(category) LIKE @search OR LOWER(COALESCE(note, \'\')) LIKE @search OR LOWER(COALESCE(payee, \'\')) LIKE @search)')
+      clauses.push(
+        "(LOWER(COALESCE(category, '')) LIKE @search OR LOWER(COALESCE(income_source, '')) LIKE @search OR LOWER(COALESCE(note, '')) LIKE @search OR LOWER(COALESCE(payee, '')) LIKE @search)",
+      )
       params.search = `%${filters.search.toLowerCase()}%`
     }
 
@@ -222,6 +241,11 @@ export class DatabaseManager {
     if (filters.type && filters.type !== 'all') {
       clauses.push('type = @type')
       params.type = filters.type
+    }
+
+    if (filters.incomeSource && filters.incomeSource !== 'all' && filters.type !== 'expense') {
+      clauses.push('income_source = @incomeSource')
+      params.incomeSource = filters.incomeSource
     }
 
     if (filters.from) {
@@ -250,7 +274,7 @@ export class DatabaseManager {
     const rows = this.db
       .prepare(
         `
-          SELECT id, amount, type, category, payee, date, note, recurring_transaction_id, created_at
+          SELECT id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at
           FROM transactions
           ${where}
           ORDER BY ${sortColumn} ${sortDirection}, created_at DESC
@@ -262,10 +286,12 @@ export class DatabaseManager {
   }
 
   addTransaction(input: TransactionInput): Transaction {
-    return this.insertTransaction(input)
+    return this.insertTransaction(normalizeTransactionInput(input))
   }
 
   updateTransaction(id: string, input: TransactionInput): Transaction {
+    const normalized = normalizeTransactionInput(input)
+
     this.db
       .prepare(
         `
@@ -273,6 +299,7 @@ export class DatabaseManager {
         SET amount = @amount,
             type = @type,
             category = @category,
+            income_source = @incomeSource,
             payee = @payee,
             date = @date,
             note = @note
@@ -281,17 +308,18 @@ export class DatabaseManager {
       )
       .run({
         id,
-        amount: input.amount,
-        type: input.type,
-        category: input.category,
-        payee: input.payee?.trim() || null,
-        date: input.date,
-        note: input.note?.trim() || null,
+        amount: normalized.amount,
+        type: normalized.type,
+        category: normalized.category,
+        incomeSource: normalized.incomeSource,
+        payee: normalized.payee?.trim() || null,
+        date: normalized.date,
+        note: normalized.note?.trim() || null,
       })
 
     const row = this.db
       .prepare(`
-        SELECT id, amount, type, category, payee, date, note, recurring_transaction_id, created_at
+        SELECT id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at
         FROM transactions
         WHERE id = ?
       `)
@@ -484,16 +512,18 @@ export class DatabaseManager {
 
   saveRecurringTransaction(input: RecurringTransactionInput): RecurringTransaction {
     const now = new Date().toISOString()
+    const normalized = normalizeRecurringTransactionInput(input)
     const payload = {
-      id: input.id ?? randomUUID(),
-      payee: input.payee.trim(),
-      amount: input.amount,
-      type: input.type,
-      category: input.category,
-      note: input.note?.trim() || null,
-      dayOfMonth: input.dayOfMonth,
-      startMonth: input.startMonth,
-      active: input.active ? 1 : 0,
+      id: normalized.id ?? randomUUID(),
+      payee: normalized.payee.trim(),
+      amount: normalized.amount,
+      type: normalized.type,
+      category: normalized.category,
+      incomeSource: normalized.incomeSource,
+      note: normalized.note?.trim() || null,
+      dayOfMonth: normalized.dayOfMonth,
+      startMonth: normalized.startMonth,
+      active: normalized.active ? 1 : 0,
       updatedAt: now,
     }
 
@@ -505,6 +535,7 @@ export class DatabaseManager {
               amount = @amount,
               type = @type,
               category = @category,
+              income_source = @incomeSource,
               note = @note,
               day_of_month = @dayOfMonth,
               start_month = @startMonth,
@@ -517,16 +548,16 @@ export class DatabaseManager {
       this.db
         .prepare(`
           INSERT INTO recurring_transactions(
-            id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+            id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
           )
-          VALUES (@id, @payee, @amount, @type, @category, @note, @dayOfMonth, @startMonth, NULL, @active, @updatedAt, @updatedAt)
+          VALUES (@id, @payee, @amount, @type, @category, @incomeSource, @note, @dayOfMonth, @startMonth, NULL, @active, @updatedAt, @updatedAt)
         `)
         .run(payload)
     }
 
     const row = this.db
       .prepare(`
-        SELECT id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
         FROM recurring_transactions
         WHERE id = ?
       `)
@@ -548,7 +579,7 @@ export class DatabaseManager {
     const day = referenceDate.getUTCDate()
     const recurringTransactions = this.db
       .prepare(`
-        SELECT id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
         FROM recurring_transactions
         WHERE active = 1
         ORDER BY created_at ASC
@@ -574,6 +605,7 @@ export class DatabaseManager {
               amount: recurring.amount,
               type: recurring.type,
               category: recurring.category,
+              incomeSource: recurring.income_source,
               payee: recurring.payee,
               date: transactionDate,
               note: recurring.note ?? '',
@@ -678,7 +710,7 @@ export class DatabaseManager {
 
   previewTransactionCsvImport(request: CsvImportPreviewRequest): CsvImportPreviewResult {
     const { fileName, headers, rows } = readCsvPreviewFile(request.filePath)
-    const signatures = new Set(this.getTransactions().map((transaction) => buildTransactionSignature(transaction)))
+    const signatures = new Set(this.queryTransactions().map((transaction) => buildTransactionSignature(transaction)))
 
     const previewRows = rows.map((values, index) => {
       const source = buildCsvSource(headers, values)
@@ -741,7 +773,7 @@ export class DatabaseManager {
         this.insertTransaction(row.transaction)
         insertedCount += 1
 
-        if (request.learnRules && row.transaction.payee?.trim()) {
+        if (request.learnRules && row.transaction.type === 'expense' && row.transaction.payee?.trim() && row.transaction.category) {
           this.upsertPayeeRule({
             payee: row.transaction.payee,
             category: row.transaction.category,
@@ -769,7 +801,7 @@ export class DatabaseManager {
       summary: buildSummary(transactions, budgetTotal),
       spendingByCategory: aggregateCategorySpend(transactions),
       spendingTrend: this.buildTrend(period, 6),
-      recentTransactions: this.getTransactions().slice(0, 10),
+      recentTransactions: this.queryTransactions().slice(0, 10),
     }
   }
 
@@ -788,7 +820,7 @@ export class DatabaseManager {
         .slice(0, 8)
         .map<TopExpenseDatum>((transaction) => ({
           id: transaction.id,
-          category: transaction.category,
+          category: transaction.category ?? 'Other',
           payee: transaction.payee,
           note: transaction.note,
           date: transaction.date,
@@ -841,7 +873,7 @@ export class DatabaseManager {
   > {
     return {
       settings: sanitizeSettingsForSnapshot(this.getSettings()),
-      transactions: this.getTransactions(),
+      transactions: this.queryTransactions(),
       budgets: this.getAllBudgetRows(),
       aiCache: this.getAllCacheRows(),
       recurringTransactions: this.getAllRecurringTransactionRows(),
@@ -877,8 +909,8 @@ export class DatabaseManager {
       this.db.prepare('DELETE FROM settings').run()
 
       const transactionInsert = this.db.prepare(`
-        INSERT INTO transactions(id, amount, type, category, payee, date, note, recurring_transaction_id, created_at)
-        VALUES (@id, @amount, @type, @category, @payee, @date, @note, @recurringTransactionId, @createdAt)
+        INSERT INTO transactions(id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at)
+        VALUES (@id, @amount, @type, @category, @incomeSource, @payee, @date, @note, @recurringTransactionId, @createdAt)
       `)
       const budgetInsert = this.db.prepare(`
         INSERT INTO budgets(id, category, amount, month)
@@ -889,8 +921,8 @@ export class DatabaseManager {
         VALUES (@key, @payload, @createdAt)
       `)
       const recurringInsert = this.db.prepare(`
-        INSERT INTO recurring_transactions(id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at)
-        VALUES (@id, @payee, @amount, @type, @category, @note, @dayOfMonth, @startMonth, @lastPostedMonth, @active, @createdAt, @updatedAt)
+        INSERT INTO recurring_transactions(id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at)
+        VALUES (@id, @payee, @amount, @type, @category, @incomeSource, @note, @dayOfMonth, @startMonth, @lastPostedMonth, @active, @createdAt, @updatedAt)
       `)
       const budgetTemplateInsert = this.db.prepare(`
         INSERT INTO budget_templates(id, category, amount, active, created_at, updated_at)
@@ -911,6 +943,7 @@ export class DatabaseManager {
           amount: transaction.amount,
           type: transaction.type,
           category: transaction.category,
+          incomeSource: transaction.incomeSource ?? null,
           payee: transaction.payee,
           date: transaction.date,
           note: transaction.note,
@@ -934,6 +967,7 @@ export class DatabaseManager {
           amount: recurring.amount,
           type: recurring.type,
           category: recurring.category,
+          incomeSource: recurring.incomeSource ?? null,
           note: recurring.note,
           dayOfMonth: recurring.dayOfMonth,
           startMonth: recurring.startMonth,
@@ -983,12 +1017,13 @@ export class DatabaseManager {
   }
 
   exportTransactionsCsv() {
-    const header = ['id', 'date', 'category', 'type', 'amount', 'payee', 'note', 'createdAt']
-    const rows = this.getTransactions().map((transaction) =>
+    const header = ['id', 'date', 'category', 'incomeSource', 'type', 'amount', 'payee', 'note', 'createdAt']
+    const rows = this.queryTransactions().map((transaction) =>
       [
         transaction.id,
         transaction.date,
-        transaction.category,
+        transaction.category ?? '',
+        transaction.incomeSource ?? '',
         transaction.type,
         transaction.amount.toFixed(2),
         transaction.payee ?? '',
@@ -1003,7 +1038,7 @@ export class DatabaseManager {
   }
 
   private getTransactionsInRange(start: Date, end: Date) {
-    return this.getTransactions({
+    return this.queryTransactions({
       from: toDateKey(start),
       to: toDateKey(end),
     })
@@ -1028,14 +1063,16 @@ export class DatabaseManager {
   }
 
   private insertTransaction(input: TransactionInput, recurringTransactionId: string | null = null): Transaction {
+    const normalized = normalizeTransactionInput(input)
     const transaction: Transaction = {
       id: randomUUID(),
-      amount: input.amount,
-      type: input.type,
-      category: input.category,
-      payee: input.payee?.trim() || null,
-      date: input.date,
-      note: input.note?.trim() || null,
+      amount: normalized.amount,
+      type: normalized.type,
+      category: normalized.category,
+      incomeSource: normalized.incomeSource,
+      payee: normalized.payee?.trim() || null,
+      date: normalized.date,
+      note: normalized.note?.trim() || null,
       recurringTransactionId,
       createdAt: new Date().toISOString(),
     }
@@ -1043,8 +1080,8 @@ export class DatabaseManager {
     this.db
       .prepare(
         `
-        INSERT INTO transactions(id, amount, type, category, payee, date, note, recurring_transaction_id, created_at)
-        VALUES (@id, @amount, @type, @category, @payee, @date, @note, @recurringTransactionId, @createdAt)
+        INSERT INTO transactions(id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at)
+        VALUES (@id, @amount, @type, @category, @incomeSource, @payee, @date, @note, @recurringTransactionId, @createdAt)
       `,
       )
       .run(transaction)
@@ -1079,7 +1116,7 @@ export class DatabaseManager {
   private getAllRecurringTransactionRows(): RecurringTransaction[] {
     const rows = this.db
       .prepare(`
-        SELECT id, payee, amount, type, category, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
         FROM recurring_transactions
         ORDER BY created_at DESC
       `)
@@ -1137,7 +1174,9 @@ export class DatabaseManager {
     const end = new Date(Date.UTC(year, monthIndex, 0, 23, 59, 59, 999))
     const expenses = this.getTransactionsInRange(start, end).filter((transaction) => transaction.type === 'expense')
     return expenses.reduce((map, transaction) => {
-      map.set(transaction.category, (map.get(transaction.category) ?? 0) + transaction.amount)
+      if (transaction.category) {
+        map.set(transaction.category, (map.get(transaction.category) ?? 0) + transaction.amount)
+      }
       return map
     }, new Map<string, number>())
   }
@@ -1171,18 +1210,128 @@ export class DatabaseManager {
   }
 
   private migrateTransactionsTable() {
-    if (!this.hasColumn('transactions', 'payee')) {
-      this.db.prepare('ALTER TABLE transactions ADD COLUMN payee TEXT').run()
+    const columns = this.getTableColumns('transactions')
+    const categoryColumn = columns.find((column) => column.name === 'category')
+    const requiresRebuild =
+      categoryColumn?.notnull === 1 ||
+      !this.hasColumn(columns, 'payee') ||
+      !this.hasColumn(columns, 'recurring_transaction_id') ||
+      !this.hasColumn(columns, 'income_source')
+
+    if (!requiresRebuild) {
+      return
     }
 
-    if (!this.hasColumn('transactions', 'recurring_transaction_id')) {
-      this.db.prepare('ALTER TABLE transactions ADD COLUMN recurring_transaction_id TEXT').run()
-    }
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE transactions_next (
+          id TEXT PRIMARY KEY,
+          amount REAL NOT NULL CHECK(amount > 0),
+          type TEXT NOT NULL CHECK(type IN ('income', 'expense')),
+          category TEXT,
+          income_source TEXT,
+          payee TEXT,
+          date TEXT NOT NULL,
+          note TEXT,
+          recurring_transaction_id TEXT,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+      `)
+
+      this.db.exec(`
+        INSERT INTO transactions_next(id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at)
+        SELECT
+          id,
+          amount,
+          type,
+          category,
+          ${this.hasColumn(columns, 'income_source') ? 'income_source' : 'NULL'},
+          ${this.hasColumn(columns, 'payee') ? 'payee' : 'NULL'},
+          date,
+          note,
+          ${this.hasColumn(columns, 'recurring_transaction_id') ? 'recurring_transaction_id' : 'NULL'},
+          created_at
+        FROM transactions;
+      `)
+
+      this.db.exec(`
+        DROP TABLE transactions;
+        ALTER TABLE transactions_next RENAME TO transactions;
+      `)
+    })()
   }
 
-  private hasColumn(tableName: string, columnName: string) {
-    const rows = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>
-    return rows.some((row) => row.name === columnName)
+  private migrateRecurringTransactionsTable() {
+    const columns = this.getTableColumns('recurring_transactions')
+    const categoryColumn = columns.find((column) => column.name === 'category')
+    const requiresRebuild = categoryColumn?.notnull === 1 || !this.hasColumn(columns, 'income_source')
+
+    if (!requiresRebuild) {
+      return
+    }
+
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE recurring_transactions_next (
+          id TEXT PRIMARY KEY,
+          payee TEXT NOT NULL,
+          amount REAL NOT NULL CHECK(amount > 0),
+          type TEXT NOT NULL CHECK(type IN ('income', 'expense')),
+          category TEXT,
+          income_source TEXT,
+          note TEXT,
+          day_of_month INTEGER NOT NULL CHECK(day_of_month >= 1 AND day_of_month <= 31),
+          start_month TEXT NOT NULL,
+          last_posted_month TEXT,
+          active INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `)
+
+      this.db.exec(`
+        INSERT INTO recurring_transactions_next(
+          id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        )
+        SELECT
+          id,
+          payee,
+          amount,
+          type,
+          category,
+          ${this.hasColumn(columns, 'income_source') ? 'income_source' : 'NULL'},
+          note,
+          day_of_month,
+          start_month,
+          last_posted_month,
+          active,
+          created_at,
+          updated_at
+        FROM recurring_transactions;
+      `)
+
+      this.db.exec(`
+        DROP TABLE recurring_transactions;
+        ALTER TABLE recurring_transactions_next RENAME TO recurring_transactions;
+      `)
+    })()
+  }
+
+  private createTransactionIndexes() {
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date DESC);
+      CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category);
+      CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type);
+      CREATE INDEX IF NOT EXISTS idx_transactions_recurring ON transactions(recurring_transaction_id) WHERE recurring_transaction_id IS NOT NULL;
+    `)
+  }
+
+  private getTableColumns(tableName: string) {
+    return this.db.prepare(`PRAGMA table_info(${tableName})`).all() as TableColumnInfo[]
+  }
+
+  private hasColumn(columns: TableColumnInfo[], columnName: string) {
+    return columns.some((column) => column.name === columnName)
   }
 
   private parseCsvRow(
@@ -1216,8 +1365,31 @@ export class DatabaseManager {
     const payee = request.mapping.payee ? source[request.mapping.payee]?.trim() : ''
     const note = request.mapping.note ? source[request.mapping.note]?.trim() : ''
     const rawCategory = request.mapping.category ? source[request.mapping.category]?.trim() : ''
-    let category = BUDGET_CATEGORIES.includes(rawCategory as (typeof BUDGET_CATEGORIES)[number]) ? rawCategory : ''
+    const rawIncomeSource = request.mapping.incomeSource ? source[request.mapping.incomeSource]?.trim() : ''
     let status: CsvImportPreviewRow['status'] = 'ready'
+
+    if (type === 'income') {
+      const incomeSource = parseImportIncomeSource(rawIncomeSource) ?? 'Other'
+      if (!parseImportIncomeSource(rawIncomeSource)) {
+        status = 'defaulted'
+      }
+
+      return {
+        status,
+        errors: [],
+        transaction: {
+          amount: amountDetails.amount,
+          type,
+          category: null,
+          incomeSource,
+          payee,
+          date,
+          note,
+        },
+      }
+    }
+
+    let category = BUDGET_CATEGORIES.includes(rawCategory as (typeof BUDGET_CATEGORIES)[number]) ? rawCategory : ''
 
     if (!category && payee) {
       const rule = this.findPayeeRule(payee)
@@ -1239,6 +1411,7 @@ export class DatabaseManager {
         amount: amountDetails.amount,
         type,
         category,
+        incomeSource: null,
         payee,
         date,
         note,
@@ -1253,6 +1426,7 @@ function mapTransactionRow(row: TransactionRow): Transaction {
     amount: row.amount,
     type: row.type,
     category: row.category,
+    incomeSource: row.income_source,
     payee: row.payee,
     date: row.date,
     note: row.note,
@@ -1268,6 +1442,7 @@ function mapRecurringTransactionRow(row: RecurringTransactionRow): RecurringTran
     amount: row.amount,
     type: row.type,
     category: row.category,
+    incomeSource: row.income_source,
     note: row.note,
     dayOfMonth: row.day_of_month,
     startMonth: row.start_month,
@@ -1370,6 +1545,66 @@ function parseImportType(value: string | undefined): TransactionType | null {
   }
 
   return null
+}
+
+function parseImportIncomeSource(value: string | undefined): IncomeSource | null {
+  const normalized = value?.trim().toLowerCase() ?? ''
+  if (!normalized) {
+    return null
+  }
+
+  const match = INCOME_SOURCES.find((source) => source.toLowerCase() === normalized)
+  return match ?? null
+}
+
+function normalizeTransactionInput(input: TransactionInput): TransactionInput & { category: string | null; incomeSource: IncomeSource | null } {
+  if (input.type === 'income') {
+    if (!input.incomeSource) {
+      throw new Error('Income source is required for income transactions.')
+    }
+
+    return {
+      ...input,
+      category: null,
+      incomeSource: input.incomeSource,
+    }
+  }
+
+  if (!input.category) {
+    throw new Error('Category is required for expense transactions.')
+  }
+
+  return {
+    ...input,
+    category: input.category,
+    incomeSource: null,
+  }
+}
+
+function normalizeRecurringTransactionInput(
+  input: RecurringTransactionInput,
+): RecurringTransactionInput & { category: string | null; incomeSource: IncomeSource | null } {
+  if (input.type === 'income') {
+    if (!input.incomeSource) {
+      throw new Error('Income source is required for recurring income transactions.')
+    }
+
+    return {
+      ...input,
+      category: null,
+      incomeSource: input.incomeSource,
+    }
+  }
+
+  if (!input.category) {
+    throw new Error('Category is required for recurring expense transactions.')
+  }
+
+  return {
+    ...input,
+    category: input.category,
+    incomeSource: null,
+  }
 }
 
 function buildTransactionSignature(transaction: {
@@ -1481,7 +1716,7 @@ function aggregateCategorySpend(transactions: Transaction[]): CategorySpendDatum
   const totals = new Map<string, number>()
 
   for (const transaction of transactions) {
-    if (transaction.type !== 'expense') continue
+    if (transaction.type !== 'expense' || !transaction.category) continue
     totals.set(transaction.category, (totals.get(transaction.category) ?? 0) + transaction.amount)
   }
 

@@ -31,8 +31,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import { BUDGET_CATEGORIES } from '@/lib/constants'
-import { formatCurrency, formatDate } from '@/lib/format'
+import { BUDGET_CATEGORIES, INCOME_SOURCES } from '@/lib/constants'
+import { formatCurrency, formatDate, formatTransactionTypeLabel } from '@/lib/format'
 import { ipc } from '@/lib/ipc'
 import { cn } from '@/lib/utils'
 
@@ -58,12 +58,23 @@ export function TransactionsPage() {
   const [savingInline, setSavingInline] = useState(false)
 
   useEffect(() => {
+    void ipc.getSettings().then(setSettings)
+    void ipc.getRecurringTransactions().then(setRecurringTransactions)
+  }, [])
+
+  useEffect(() => {
     void loadTransactions(filters)
   }, [filters])
 
   async function loadTransactions(nextFilters: TransactionFilters) {
+    const rows = await ipc.getTransactions(nextFilters)
+    setTransactions(rows)
+    setSelectedIds([])
+  }
+
+  async function reloadAll() {
     const [rows, appSettings, recurring] = await Promise.all([
-      ipc.getTransactions(nextFilters),
+      ipc.getTransactions(filters),
       ipc.getSettings(),
       ipc.getRecurringTransactions(),
     ])
@@ -75,7 +86,7 @@ export function TransactionsPage() {
 
   async function saveTransaction(transaction: TransactionInput, options: { rememberPayeeRule: boolean }) {
     await ipc.addTransaction(transaction)
-    if (options.rememberPayeeRule && transaction.payee?.trim()) {
+    if (options.rememberPayeeRule && transaction.type === 'expense' && transaction.payee?.trim() && transaction.category) {
       await ipc.upsertPayeeRule({ payee: transaction.payee, category: transaction.category })
     }
     await loadTransactions(filters)
@@ -87,14 +98,14 @@ export function TransactionsPage() {
     await loadTransactions(filters)
   }
 
-  async function saveRecurringTransaction(recurring: RecurringTransaction) {
+  async function deleteRecurringTransaction(recurring: RecurringTransaction) {
     await ipc.deleteRecurringTransaction(recurring.id)
-    await loadTransactions(filters)
+    await reloadAll()
   }
 
   async function upsertRecurringTransaction(recurring: Parameters<typeof ipc.saveRecurringTransaction>[0]) {
     await ipc.saveRecurringTransaction(recurring)
-    await loadTransactions(filters)
+    await reloadAll()
   }
 
   function startInlineEdit(transaction: Transaction) {
@@ -103,6 +114,7 @@ export function TransactionsPage() {
       amount: transaction.amount,
       type: transaction.type,
       category: transaction.category,
+      incomeSource: transaction.incomeSource,
       payee: transaction.payee ?? '',
       date: transaction.date,
       note: transaction.note ?? '',
@@ -133,6 +145,26 @@ export function TransactionsPage() {
 
   function updateEditField<Key extends keyof TransactionInput>(key: Key, value: TransactionInput[Key]) {
     setEditDraft((current) => (current ? { ...current, [key]: value } : current))
+  }
+
+  function updateEditType(type: TransactionType) {
+    setEditDraft((current) => {
+      if (!current) return current
+
+      return type === 'income'
+        ? {
+            ...current,
+            type,
+            category: null,
+            incomeSource: current.incomeSource ?? INCOME_SOURCES[0],
+          }
+        : {
+            ...current,
+            type,
+            category: current.category ?? BUDGET_CATEGORIES[0],
+            incomeSource: null,
+          }
+    })
   }
 
   function toggleSort(field: TransactionSortField) {
@@ -189,7 +221,7 @@ export function TransactionsPage() {
 
       <Card className="border-border/80 bg-card/90">
         <CardContent className="grid gap-4 pt-6">
-          <div className="grid gap-4 lg:grid-cols-[1.5fr_repeat(5,minmax(0,1fr))]">
+          <div className="grid gap-4 lg:grid-cols-[1.5fr_repeat(6,minmax(0,1fr))]">
             <label className="relative">
               <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
               <Input
@@ -197,7 +229,7 @@ export function TransactionsPage() {
                 autoComplete="off"
                 className="pl-10"
                 name="transaction-search"
-                placeholder="Search note, payee, or category…"
+                placeholder="Search note, payee, category, or income type..."
                 value={filters.search ?? ''}
                 onChange={(event) => setFilters((current) => ({ ...current, search: event.target.value }))}
               />
@@ -224,7 +256,13 @@ export function TransactionsPage() {
 
             <Select
               value={filters.type ?? 'all'}
-              onValueChange={(value) => setFilters((current) => ({ ...current, type: value as TransactionFilters['type'] }))}
+              onValueChange={(value) =>
+                setFilters((current) => ({
+                  ...current,
+                  type: value as TransactionFilters['type'],
+                  incomeSource: value === 'expense' ? undefined : current.incomeSource,
+                }))
+              }
             >
               <SelectTrigger aria-label="Filter by transaction type" className="w-full">
                 <SelectValue placeholder="Type" />
@@ -233,6 +271,28 @@ export function TransactionsPage() {
                 <SelectItem value="all">All Types</SelectItem>
                 <SelectItem value="expense">Expense</SelectItem>
                 <SelectItem value="income">Income</SelectItem>
+              </SelectContent>
+            </Select>
+
+            <Select
+              value={filters.incomeSource ?? 'all'}
+              onValueChange={(value) =>
+                setFilters((current) => ({
+                  ...current,
+                  incomeSource: value === 'all' ? undefined : value,
+                }))
+              }
+            >
+              <SelectTrigger aria-label="Filter by income type" className="w-full" disabled={filters.type === 'expense'}>
+                <SelectValue placeholder="Income Type" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All Income Types</SelectItem>
+                {INCOME_SOURCES.map((incomeSource) => (
+                  <SelectItem key={incomeSource} value={incomeSource}>
+                    {incomeSource}
+                  </SelectItem>
+                ))}
               </SelectContent>
             </Select>
 
@@ -260,7 +320,7 @@ export function TransactionsPage() {
                 inputMode="decimal"
                 min="0"
                 name="min-amount"
-                placeholder="Min…"
+                placeholder="Min..."
                 type="number"
                 value={filters.minAmount ?? ''}
                 onChange={(event) =>
@@ -275,7 +335,7 @@ export function TransactionsPage() {
                 inputMode="decimal"
                 min="0"
                 name="max-amount"
-                placeholder="Max…"
+                placeholder="Max..."
                 type="number"
                 value={filters.maxAmount ?? ''}
                 onChange={(event) =>
@@ -334,7 +394,7 @@ export function TransactionsPage() {
                     <TableRow key={transaction.id}>
                       <TableCell>
                         <input
-                          aria-label={`Select transaction ${transaction.category} on ${formatDate(transaction.date)}`}
+                          aria-label={`Select transaction ${transaction.category ?? transaction.incomeSource ?? transaction.type} on ${formatDate(transaction.date)}`}
                           checked={selectedIds.includes(transaction.id)}
                           className="focus-ring size-4 rounded border border-input"
                           type="checkbox"
@@ -356,21 +416,39 @@ export function TransactionsPage() {
                       </TableCell>
                       <TableCell>
                         {isEditing ? (
-                          <Select value={editDraft.category} onValueChange={(value) => updateEditField('category', value)}>
-                            <SelectTrigger aria-label="Edit transaction category" className="h-9 w-full min-w-[11rem]">
-                              <SelectValue />
-                            </SelectTrigger>
-                            <SelectContent>
-                              {BUDGET_CATEGORIES.map((category) => (
-                                <SelectItem key={category} value={category}>
-                                  {category}
-                                </SelectItem>
-                              ))}
-                            </SelectContent>
-                          </Select>
+                          editDraft.type === 'expense' ? (
+                            <Select value={editDraft.category ?? undefined} onValueChange={(value) => updateEditField('category', value)}>
+                              <SelectTrigger aria-label="Edit transaction category" className="h-9 w-full min-w-[11rem]">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {BUDGET_CATEGORIES.map((category) => (
+                                  <SelectItem key={category} value={category}>
+                                    {category}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          ) : (
+                            <Select
+                              value={editDraft.incomeSource ?? undefined}
+                              onValueChange={(value) => updateEditField('incomeSource', value as TransactionInput['incomeSource'])}
+                            >
+                              <SelectTrigger aria-label="Edit income type" className="h-9 w-full min-w-[11rem]">
+                                <SelectValue />
+                              </SelectTrigger>
+                              <SelectContent>
+                                {INCOME_SOURCES.map((incomeSource) => (
+                                  <SelectItem key={incomeSource} value={incomeSource}>
+                                    {incomeSource}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          )
                         ) : (
                           <div className="flex items-center gap-2">
-                            <span>{transaction.category}</span>
+                            <span>{transaction.category ?? '—'}</span>
                             {transaction.recurringTransactionId ? <Badge variant="outline">Recurring</Badge> : null}
                           </div>
                         )}
@@ -394,7 +472,7 @@ export function TransactionsPage() {
                             aria-label="Edit transaction note"
                             autoComplete="off"
                             className="h-9"
-                            placeholder="Optional note…"
+                            placeholder="Optional note..."
                             value={editDraft.note ?? ''}
                             onChange={(event) => updateEditField('note', event.target.value)}
                           />
@@ -404,7 +482,7 @@ export function TransactionsPage() {
                       </TableCell>
                       <TableCell>
                         {isEditing ? (
-                          <Select value={editDraft.type} onValueChange={(value) => updateEditField('type', value as TransactionType)}>
+                          <Select value={editDraft.type} onValueChange={(value) => updateEditType(value as TransactionType)}>
                             <SelectTrigger aria-label="Edit transaction type" className="h-9 w-full min-w-[8rem]">
                               <SelectValue />
                             </SelectTrigger>
@@ -414,7 +492,7 @@ export function TransactionsPage() {
                             </SelectContent>
                           </Select>
                         ) : (
-                          <span className="capitalize">{transaction.type}</span>
+                          <span>{formatTransactionTypeLabel(transaction.type, transaction.incomeSource)}</span>
                         )}
                       </TableCell>
                       <TableCell className="text-right font-medium tabular-nums">
@@ -439,7 +517,7 @@ export function TransactionsPage() {
                             <>
                               <Button size="sm" onClick={() => void saveInlineEdit()} disabled={savingInline}>
                                 <Check data-icon="inline-start" />
-                                {savingInline ? 'Saving…' : 'Save'}
+                                {savingInline ? 'Saving...' : 'Save'}
                               </Button>
                               <Button variant="outline" size="sm" onClick={cancelInlineEdit}>
                                 <X data-icon="inline-start" />
@@ -500,7 +578,7 @@ export function TransactionsPage() {
                 <div className="space-y-1">
                   <p className="font-medium text-foreground">{recurring.payee}</p>
                   <p className="text-sm text-muted-foreground">
-                    {formatCurrency(recurring.amount, currency)} · {recurring.category} · day {recurring.dayOfMonth} · starts {recurring.startMonth}
+                    {formatCurrency(recurring.amount, currency)} · {recurring.type === 'income' ? recurring.incomeSource ?? 'Unspecified' : recurring.category ?? '—'} · day {recurring.dayOfMonth} · starts {recurring.startMonth}
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -515,7 +593,7 @@ export function TransactionsPage() {
                   >
                     Edit
                   </Button>
-                  <Button variant="ghost" size="sm" onClick={() => void saveRecurringTransaction(recurring)}>
+                  <Button variant="ghost" size="sm" onClick={() => void deleteRecurringTransaction(recurring)}>
                     Delete
                   </Button>
                 </div>

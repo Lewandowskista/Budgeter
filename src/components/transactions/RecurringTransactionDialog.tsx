@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { RecurringTransaction, RecurringTransactionInput, TransactionType } from '../../../shared/types'
-import { BUDGET_CATEGORIES } from '@/lib/constants'
+import type { IncomeSource, RecurringTransaction, RecurringTransactionInput, TransactionType } from '../../../shared/types'
+import { BUDGET_CATEGORIES, INCOME_SOURCES } from '@/lib/constants'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -26,6 +26,7 @@ const blankRecurring: RecurringTransactionInput = {
   amount: 0,
   type: 'expense',
   category: 'Rent/Housing',
+  incomeSource: null,
   note: '',
   dayOfMonth: 1,
   startMonth: new Date().toISOString().slice(0, 7),
@@ -49,6 +50,7 @@ export function RecurringTransactionDialog({
         amount: recurring.amount,
         type: recurring.type,
         category: recurring.category,
+        incomeSource: recurring.incomeSource,
         note: recurring.note ?? '',
         dayOfMonth: recurring.dayOfMonth,
         startMonth: recurring.startMonth,
@@ -66,12 +68,23 @@ export function RecurringTransactionDialog({
     event.preventDefault()
     setSaving(true)
     try {
+      const normalizedForm: RecurringTransactionInput =
+        form.type === 'income'
+          ? {
+              ...form,
+              category: null,
+            }
+          : {
+              ...form,
+              incomeSource: null,
+            }
+
       await onSubmit({
-        ...form,
-        payee: form.payee.trim(),
-        note: form.note?.trim() ?? '',
-        amount: Number(form.amount),
-        dayOfMonth: Number(form.dayOfMonth),
+        ...normalizedForm,
+        payee: normalizedForm.payee.trim(),
+        note: normalizedForm.note?.trim() ?? '',
+        amount: Number(normalizedForm.amount),
+        dayOfMonth: Number(normalizedForm.dayOfMonth),
       })
       onOpenChange(false)
     } finally {
@@ -81,6 +94,24 @@ export function RecurringTransactionDialog({
 
   function updateField<Key extends keyof RecurringTransactionInput>(key: Key, value: RecurringTransactionInput[Key]) {
     setForm((current) => ({ ...current, [key]: value }))
+  }
+
+  function updateType(type: TransactionType) {
+    setForm((current) =>
+      type === 'income'
+        ? {
+            ...current,
+            type,
+            category: null,
+            incomeSource: current.incomeSource ?? INCOME_SOURCES[0],
+          }
+        : {
+            ...current,
+            type,
+            category: current.category ?? BUDGET_CATEGORIES[0],
+            incomeSource: null,
+          },
+    )
   }
 
   return (
@@ -113,7 +144,7 @@ export function RecurringTransactionDialog({
           <div className="grid gap-4 sm:grid-cols-2">
             <label className="grid gap-2 text-sm font-medium text-foreground">
               Type
-              <Select value={form.type} onValueChange={(value) => updateField('type', value as TransactionType)}>
+              <Select value={form.type} onValueChange={(value) => updateType(value as TransactionType)}>
                 <SelectTrigger className="w-full">
                   <SelectValue />
                 </SelectTrigger>
@@ -123,21 +154,39 @@ export function RecurringTransactionDialog({
                 </SelectContent>
               </Select>
             </label>
-            <label className="grid gap-2 text-sm font-medium text-foreground">
-              Category
-              <Select value={form.category} onValueChange={(value) => updateField('category', value)}>
-                <SelectTrigger className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {BUDGET_CATEGORIES.map((category) => (
-                    <SelectItem key={category} value={category}>
-                      {category}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </label>
+            {form.type === 'expense' ? (
+              <label className="grid gap-2 text-sm font-medium text-foreground">
+                Category
+                <Select value={form.category ?? undefined} onValueChange={(value) => updateField('category', value)}>
+                  <SelectTrigger className="w-full" aria-label="Category">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BUDGET_CATEGORIES.map((category) => (
+                      <SelectItem key={category} value={category}>
+                        {category}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+            ) : (
+              <label className="grid gap-2 text-sm font-medium text-foreground">
+                Income Type
+                <Select value={form.incomeSource ?? undefined} onValueChange={(value) => updateField('incomeSource', value as IncomeSource)}>
+                  <SelectTrigger className="w-full" aria-label="Income Type">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {INCOME_SOURCES.map((incomeSource) => (
+                      <SelectItem key={incomeSource} value={incomeSource}>
+                        {incomeSource}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </label>
+            )}
           </div>
 
           <div className="grid gap-4 sm:grid-cols-2">

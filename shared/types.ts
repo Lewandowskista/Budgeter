@@ -1,5 +1,8 @@
+import type { INCOME_SOURCES } from './constants'
+
 export type ThemeMode = 'light' | 'dark' | 'system'
 export type TransactionType = 'income' | 'expense'
+export type IncomeSource = (typeof INCOME_SOURCES)[number]
 export type Period = 'week' | 'month' | 'year'
 export type TransactionSortField = 'date' | 'category' | 'amount' | 'type' | 'note' | 'payee'
 export type SortDirection = 'asc' | 'desc'
@@ -36,7 +39,8 @@ export interface Transaction {
   id: string
   amount: number
   type: TransactionType
-  category: string
+  category: string | null
+  incomeSource: IncomeSource | null
   payee: string | null
   date: string
   note: string | null
@@ -47,7 +51,8 @@ export interface Transaction {
 export interface TransactionInput {
   amount: number
   type: TransactionType
-  category: string
+  category?: string | null
+  incomeSource?: IncomeSource | null
   payee?: string
   date: string
   note?: string
@@ -56,6 +61,7 @@ export interface TransactionInput {
 export interface TransactionFilters {
   search?: string
   category?: string
+  incomeSource?: IncomeSource | 'all'
   type?: TransactionType | 'all'
   from?: string
   to?: string
@@ -202,7 +208,8 @@ export interface RecurringTransaction {
   payee: string
   amount: number
   type: TransactionType
-  category: string
+  category: string | null
+  incomeSource: IncomeSource | null
   note: string | null
   dayOfMonth: number
   startMonth: string
@@ -217,7 +224,8 @@ export interface RecurringTransactionInput {
   payee: string
   amount: number
   type: TransactionType
-  category: string
+  category?: string | null
+  incomeSource?: IncomeSource | null
   note?: string
   dayOfMonth: number
   startMonth: string
@@ -255,6 +263,7 @@ export interface CsvImportMapping {
   amount: string
   type?: string
   category?: string
+  incomeSource?: string
   payee?: string
   note?: string
 }

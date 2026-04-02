@@ -25,6 +25,15 @@ export const BUDGET_CATEGORIES = [
   'Other',
 ] as const
 
+export const INCOME_SOURCES = [
+  'Salary',
+  'Meal Tickets',
+  'Bonus',
+  'Gift',
+  'Refund',
+  'Other',
+] as const
+
 export const CATEGORY_COLORS: Record<string, string> = {
   'Food & Dining': '#D4944A',
   'Rent/Housing': '#5B8A72',

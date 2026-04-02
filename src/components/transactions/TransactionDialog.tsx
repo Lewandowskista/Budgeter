@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { Transaction, TransactionInput, TransactionType } from '../../../shared/types'
-import { BUDGET_CATEGORIES } from '@/lib/constants'
+import type { IncomeSource, Transaction, TransactionInput, TransactionType } from '../../../shared/types'
+import { BUDGET_CATEGORIES, INCOME_SOURCES } from '@/lib/constants'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -27,6 +27,7 @@ const blankTransaction: TransactionInput = {
   amount: 0,
   type: 'expense',
   category: BUDGET_CATEGORIES[0],
+  incomeSource: null,
   payee: '',
   date: new Date().toISOString().slice(0, 10),
   note: '',
@@ -45,6 +46,7 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
         amount: initialValue.amount,
         type: initialValue.type,
         category: initialValue.category,
+        incomeSource: initialValue.incomeSource,
         payee: initialValue.payee ?? '',
         date: initialValue.date,
         note: initialValue.note ?? '',
@@ -76,10 +78,21 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
 
     setSaving(true)
     try {
+      const normalizedForm: TransactionInput =
+        form.type === 'income'
+          ? {
+              ...form,
+              category: null,
+            }
+          : {
+              ...form,
+              incomeSource: null,
+            }
+
       await onSubmit(
         {
-          ...form,
-          amount: Number(form.amount),
+          ...normalizedForm,
+          amount: Number(normalizedForm.amount),
         },
         { rememberPayeeRule },
       )
@@ -90,7 +103,7 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
   }
 
   async function autoFillCategoryFromPayee() {
-    if (categoryTouched || !form.payee?.trim()) {
+    if (form.type !== 'expense' || categoryTouched || !form.payee?.trim()) {
       return
     }
 
@@ -102,6 +115,31 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
 
   function updateField<Key extends keyof TransactionInput>(key: Key, value: TransactionInput[Key]) {
     setForm((current) => ({ ...current, [key]: value }))
+  }
+
+  function updateType(type: TransactionType) {
+    setRememberPayeeRule((current) => (type === 'expense' ? current : false))
+    setForm((current) =>
+      type === 'income'
+        ? {
+            ...current,
+            type,
+            category: null,
+            incomeSource: current.incomeSource ?? INCOME_SOURCES[0],
+          }
+        : {
+            ...current,
+            type,
+            category: current.category ?? BUDGET_CATEGORIES[0],
+            incomeSource: null,
+          },
+    )
+
+    setErrors((current) => ({
+      ...current,
+      category: undefined,
+      incomeSource: undefined,
+    }))
   }
 
   return (
@@ -121,7 +159,7 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
                   key={type}
                   type="button"
                   variant={form.type === type ? 'default' : 'outline'}
-                  onClick={() => updateField('type', type)}
+                  onClick={() => updateType(type)}
                 >
                   {type === 'expense' ? 'Expense' : 'Income'}
                 </Button>
@@ -175,30 +213,61 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
               />
             </label>
 
-            <label className="grid gap-2 text-sm font-medium text-foreground">
-              Category
-              <Select
-                value={form.category}
-                onValueChange={(value) => {
-                  setCategoryTouched(true)
-                  updateField('category', value)
-                }}
-              >
-                <SelectTrigger className="w-full">
-                  <SelectValue placeholder="Select a category" />
-                </SelectTrigger>
-                <SelectContent>
-                  {BUDGET_CATEGORIES.map((category) => (
-                    <SelectItem key={category} value={category}>
-                      {category}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </label>
+            {form.type === 'expense' ? (
+              <label className="grid gap-2 text-sm font-medium text-foreground">
+                Category
+                <Select
+                  value={form.category ?? undefined}
+                  onValueChange={(value) => {
+                    setCategoryTouched(true)
+                    updateField('category', value)
+                    if (errors.category) {
+                      setErrors((current) => ({ ...current, category: undefined }))
+                    }
+                  }}
+                >
+                  <SelectTrigger className="w-full" aria-label="Category">
+                    <SelectValue placeholder="Select a category" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {BUDGET_CATEGORIES.map((category) => (
+                      <SelectItem key={category} value={category}>
+                        {category}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {errors.category ? <span className="text-sm text-destructive">{errors.category}</span> : null}
+              </label>
+            ) : (
+              <label className="grid gap-2 text-sm font-medium text-foreground">
+                Income Type
+                <Select
+                  value={form.incomeSource ?? undefined}
+                  onValueChange={(value) => {
+                    updateField('incomeSource', value as IncomeSource)
+                    if (errors.incomeSource) {
+                      setErrors((current) => ({ ...current, incomeSource: undefined }))
+                    }
+                  }}
+                >
+                  <SelectTrigger className="w-full" aria-label="Income Type">
+                    <SelectValue placeholder="Select an income type" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {INCOME_SOURCES.map((incomeSource) => (
+                      <SelectItem key={incomeSource} value={incomeSource}>
+                        {incomeSource}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {errors.incomeSource ? <span className="text-sm text-destructive">{errors.incomeSource}</span> : null}
+              </label>
+            )}
           </div>
 
-          {form.payee?.trim() ? (
+          {form.type === 'expense' && form.payee?.trim() ? (
             <label className="flex items-center gap-2 text-sm text-muted-foreground">
               <input
                 checked={rememberPayeeRule}

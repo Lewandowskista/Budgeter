@@ -1,3 +1,5 @@
+import type { IncomeSource, TransactionType } from '../../shared/types'
+
 export function formatCurrency(amount: number, currency: string, locale?: string) {
   return new Intl.NumberFormat(locale, {
     style: 'currency',
@@ -23,5 +25,13 @@ export function formatDate(date: string, locale?: string) {
 
 export function currentMonthValue() {
   const date = new Date()
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+export function formatTransactionTypeLabel(type: TransactionType, incomeSource: IncomeSource | null) {
+  if (type === 'expense') {
+    return 'Expense'
+  }
+
+  return `Income - ${incomeSource ?? 'Unspecified'}`
 }
