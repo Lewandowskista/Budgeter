@@ -31,6 +31,10 @@ const blankRecurring: RecurringTransactionInput = {
   dayOfMonth: 1,
   startMonth: new Date().toISOString().slice(0, 7),
   active: true,
+  postingMode: 'auto',
+  expectedAmount: 0,
+  reminderDays: 3,
+  subscriptionLabel: '',
 }
 
 export function RecurringTransactionDialog({
@@ -55,6 +59,10 @@ export function RecurringTransactionDialog({
         dayOfMonth: recurring.dayOfMonth,
         startMonth: recurring.startMonth,
         active: recurring.active,
+        postingMode: recurring.postingMode,
+        expectedAmount: recurring.expectedAmount,
+        reminderDays: recurring.reminderDays,
+        subscriptionLabel: recurring.subscriptionLabel ?? '',
       })
       return
     }
@@ -84,7 +92,9 @@ export function RecurringTransactionDialog({
         payee: normalizedForm.payee.trim(),
         note: normalizedForm.note?.trim() ?? '',
         amount: Number(normalizedForm.amount),
+        expectedAmount: Number(normalizedForm.expectedAmount),
         dayOfMonth: Number(normalizedForm.dayOfMonth),
+        reminderDays: Number(normalizedForm.reminderDays),
       })
       onOpenChange(false)
     } finally {
@@ -119,7 +129,7 @@ export function RecurringTransactionDialog({
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
           <DialogTitle>{recurring ? 'Edit recurring transaction' : 'New recurring transaction'}</DialogTitle>
-          <DialogDescription>Monthly recurring entries post automatically once they are due in the current month.</DialogDescription>
+          <DialogDescription>Choose whether this recurring item auto-posts into the ledger or stays as a reminder until you act on it.</DialogDescription>
         </DialogHeader>
 
         <form className="grid gap-4" onSubmit={handleSubmit}>
@@ -204,6 +214,55 @@ export function RecurringTransactionDialog({
             <label className="grid gap-2 text-sm font-medium text-foreground">
               Start month
               <Input required type="month" value={form.startMonth} onChange={(event) => updateField('startMonth', event.target.value)} />
+            </label>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <label className="grid gap-2 text-sm font-medium text-foreground">
+              Posting mode
+              <Select value={form.postingMode} onValueChange={(value) => updateField('postingMode', value as RecurringTransactionInput['postingMode'])}>
+                <SelectTrigger className="w-full" aria-label="Posting mode">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">Auto-post</SelectItem>
+                  <SelectItem value="reminder">Reminder only</SelectItem>
+                </SelectContent>
+              </Select>
+            </label>
+            <label className="grid gap-2 text-sm font-medium text-foreground">
+              Expected amount
+              <Input
+                aria-label="Expected amount"
+                min="0.01"
+                step="0.01"
+                type="number"
+                value={form.expectedAmount || ''}
+                onChange={(event) => updateField('expectedAmount', Number(event.target.value))}
+              />
+            </label>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <label className="grid gap-2 text-sm font-medium text-foreground">
+              Remind me
+              <Input
+                aria-label="Remind me"
+                min="0"
+                max="30"
+                type="number"
+                value={form.reminderDays}
+                onChange={(event) => updateField('reminderDays', Number(event.target.value))}
+              />
+            </label>
+            <label className="grid gap-2 text-sm font-medium text-foreground">
+              Subscription label
+              <Input
+                aria-label="Subscription label"
+                placeholder="Optional, e.g. Streaming"
+                value={form.subscriptionLabel ?? ''}
+                onChange={(event) => updateField('subscriptionLabel', event.target.value)}
+              />
             </label>
           </div>
 

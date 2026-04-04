@@ -24,6 +24,7 @@ export function BudgetTemplateDialog({ open, template, onOpenChange, onSubmit }:
   const [category, setCategory] = useState<string>(BUDGET_CATEGORIES[0])
   const [amount, setAmount] = useState('')
   const [active, setActive] = useState(true)
+  const [rolloverEnabled, setRolloverEnabled] = useState(false)
   const [saving, setSaving] = useState(false)
 
   useEffect(() => {
@@ -31,6 +32,7 @@ export function BudgetTemplateDialog({ open, template, onOpenChange, onSubmit }:
       setCategory(template.category)
       setAmount(String(template.amount))
       setActive(template.active)
+      setRolloverEnabled(template.rolloverEnabled)
       return
     }
 
@@ -38,6 +40,7 @@ export function BudgetTemplateDialog({ open, template, onOpenChange, onSubmit }:
       setCategory(BUDGET_CATEGORIES[0])
       setAmount('')
       setActive(true)
+      setRolloverEnabled(false)
     }
   }, [open, template])
 
@@ -50,6 +53,7 @@ export function BudgetTemplateDialog({ open, template, onOpenChange, onSubmit }:
         category,
         amount: Number(amount),
         active,
+        rolloverEnabled,
       })
       onOpenChange(false)
     } finally {
@@ -95,6 +99,16 @@ export function BudgetTemplateDialog({ open, template, onOpenChange, onSubmit }:
               onChange={(event) => setActive(event.target.checked)}
             />
             Active template
+          </label>
+
+          <label className="flex items-center gap-2 text-sm text-muted-foreground">
+            <input
+              checked={rolloverEnabled}
+              className="focus-ring size-4 rounded border border-input"
+              type="checkbox"
+              onChange={(event) => setRolloverEnabled(event.target.checked)}
+            />
+            Enable rollover for months created from this template
           </label>
 
           <DialogFooter className="border-t-0 bg-transparent p-0">

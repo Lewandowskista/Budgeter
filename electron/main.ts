@@ -2,16 +2,19 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'path'
 import {
+  WebContents,
   app,
   BrowserWindow,
   dialog,
   ipcMain,
   Menu,
+  Notification,
   type IpcMainInvokeEvent,
   type MenuItemConstructorOptions,
 } from 'electron'
 import { APP_NAME } from '../shared/constants'
 import type {
+  AIAnalysisProgress,
   AnalyzeInsightsInput,
   AppMenu,
   AppSettings,
@@ -20,7 +23,9 @@ import type {
   BudgetInput,
   BudgetTemplateInput,
   CsvImportPreviewRequest,
+  CustomCategoryInput,
   PayeeRuleInput,
+  SavedCsvMapping,
   MenuAnchorPosition,
   Period,
   RecurringTransactionInput,
@@ -28,6 +33,7 @@ import type {
   TransactionInput,
   WindowState,
 } from '../shared/types'
+import { buildDesktopAlerts, consumeDesktopAlerts, createEmptyAlertState, type AlertState } from './alerts'
 import { analyzeInsights } from './ai'
 import { parseCsv, readCsvFile } from './csv'
 import { DatabaseManager } from './database'
@@ -36,6 +42,8 @@ const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 const SNAPSHOT_SCHEMA_VERSION = 1
 let database: DatabaseManager
 let snapshotsDir = ''
+let alertsStatePath = ''
+let alertState: AlertState = createEmptyAlertState()
 let mainWindow: BrowserWindow | null = null
 
 function getMainWindow() {
@@ -172,6 +180,12 @@ function sendWindowState(win: BrowserWindow) {
   win.webContents.send('window:state-changed', getWindowState(win))
 }
 
+function sendAIInsightsProgress(webContents: WebContents, progress: AIAnalysisProgress) {
+  if (!webContents.isDestroyed()) {
+    webContents.send('ai:analyze:progress', progress)
+  }
+}
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 1280,
@@ -213,7 +227,65 @@ function createWindow() {
   })
 }
 
+function loadAlertState() {
+  if (!alertsStatePath || !fs.existsSync(alertsStatePath)) {
+    alertState = createEmptyAlertState()
+    return
+  }
+
+  try {
+    const parsed = JSON.parse(fs.readFileSync(alertsStatePath, 'utf8')) as AlertState
+    alertState = parsed?.sentAtById ? parsed : createEmptyAlertState()
+  } catch {
+    alertState = createEmptyAlertState()
+  }
+}
+
+function saveAlertState() {
+  if (!alertsStatePath) {
+    return
+  }
+
+  fs.writeFileSync(alertsStatePath, JSON.stringify(alertState, null, 2), 'utf8')
+}
+
+function runAlertSweep(referenceDate = new Date()) {
+  if (!Notification.isSupported()) {
+    return
+  }
+
+  const settings = database.getSettings()
+  const currentMonth = referenceDate.toISOString().slice(0, 7)
+  const next = consumeDesktopAlerts(
+    buildDesktopAlerts({
+      settings,
+      budgets: database.getBudgets(currentMonth).budgets,
+      recurringTransactions: database.getRecurringTransactions(),
+      upcomingBills: database.getUpcomingBills(referenceDate),
+      referenceDate,
+    }),
+    alertState,
+    referenceDate,
+  )
+
+  alertState = next.state
+  saveAlertState()
+
+  for (const alert of next.alerts) {
+    new Notification({
+      title: alert.title,
+      body: alert.body,
+    }).show()
+  }
+}
+
 function registerIpcHandlers() {
+  async function withAlertRefresh<T>(action: () => T | Promise<T>) {
+    const result = await action()
+    runAlertSweep()
+    return result
+  }
+
   ipcMain.handle('app:get-info', () => ({
     name: APP_NAME,
     version: app.getVersion(),
@@ -280,44 +352,70 @@ function registerIpcHandlers() {
 
   ipcMain.handle('settings:get', () => database.getSettings())
   ipcMain.handle('settings:update', (_event: IpcMainInvokeEvent, payload: Partial<AppSettings>) =>
-    database.updateSettings(payload),
+    withAlertRefresh(() => database.updateSettings(payload)),
   )
 
   ipcMain.handle('transactions:list', (_event: IpcMainInvokeEvent, filters: TransactionFilters | undefined) =>
     database.getTransactions(filters),
   )
+  ipcMain.handle('transactions:pending-review', () => database.getPendingReviewTransactions())
   ipcMain.handle('transactions:add', (_event: IpcMainInvokeEvent, transaction: TransactionInput) =>
-    database.addTransaction(transaction),
+    withAlertRefresh(() => database.addTransaction(transaction)),
   )
   ipcMain.handle(
     'transactions:update',
     (_event: IpcMainInvokeEvent, payload: { id: string; transaction: TransactionInput }) =>
-      database.updateTransaction(payload.id, payload.transaction),
+      withAlertRefresh(() => database.updateTransaction(payload.id, payload.transaction)),
   )
-  ipcMain.handle('transactions:delete', (_event: IpcMainInvokeEvent, ids: string[]) => database.deleteTransactions(ids))
+  ipcMain.handle('transactions:delete', (_event: IpcMainInvokeEvent, ids: string[]) =>
+    withAlertRefresh(() => database.deleteTransactions(ids)),
+  )
+  ipcMain.handle(
+    'transactions:bulk-update-category',
+    (_event: IpcMainInvokeEvent, payload: { ids: string[]; category: string }) =>
+      withAlertRefresh(() => database.bulkUpdateTransactionCategory(payload.ids, payload.category)),
+  )
+  ipcMain.handle('transactions:mark-reviewed', (_event: IpcMainInvokeEvent, ids: string[]) =>
+    withAlertRefresh(() => database.markTransactionsReviewed(ids)),
+  )
 
   ipcMain.handle('budgets:list', (_event: IpcMainInvokeEvent, month: string) => database.getBudgets(month))
-  ipcMain.handle('budgets:set', (_event: IpcMainInvokeEvent, budget: BudgetInput) => database.setBudget(budget))
+  ipcMain.handle('budgets:set', (_event: IpcMainInvokeEvent, budget: BudgetInput) =>
+    withAlertRefresh(() => database.setBudget(budget)),
+  )
   ipcMain.handle(
     'budgets:delete',
-    (_event: IpcMainInvokeEvent, payload: { id: string; month: string }) => database.deleteBudget(payload.id, payload.month),
+    (_event: IpcMainInvokeEvent, payload: { id: string; month: string }) =>
+      withAlertRefresh(() => database.deleteBudget(payload.id, payload.month)),
   )
   ipcMain.handle('budgets:templates:list', () => database.getBudgetTemplates())
   ipcMain.handle('budgets:templates:save', (_event: IpcMainInvokeEvent, template: BudgetTemplateInput) =>
     database.saveBudgetTemplate(template),
   )
   ipcMain.handle('budgets:templates:delete', (_event: IpcMainInvokeEvent, id: string) => database.deleteBudgetTemplate(id))
-  ipcMain.handle('budgets:templates:apply', (_event: IpcMainInvokeEvent, month: string) => database.applyBudgetTemplates(month))
+  ipcMain.handle('budgets:templates:apply', (_event: IpcMainInvokeEvent, month: string) =>
+    withAlertRefresh(() => database.applyBudgetTemplates(month)),
+  )
   ipcMain.handle('budgets:templates:save-month', (_event: IpcMainInvokeEvent, month: string) =>
     database.saveMonthAsBudgetTemplates(month),
   )
+  ipcMain.handle('budgets:copy-from-prev', (_event: IpcMainInvokeEvent, month: string) =>
+    withAlertRefresh(() => database.copyBudgetsFromPreviousMonth(month)),
+  )
+
+  ipcMain.handle('categories:list', () => database.getCategories())
+  ipcMain.handle('categories:add', (_event: IpcMainInvokeEvent, input: CustomCategoryInput) => database.addCustomCategory(input))
+  ipcMain.handle('categories:delete', (_event: IpcMainInvokeEvent, id: string) => database.deleteCustomCategory(id))
 
   ipcMain.handle('recurring:list', () => database.getRecurringTransactions())
+  ipcMain.handle('recurring:upcoming', () => database.getUpcomingBills())
   ipcMain.handle('recurring:save', (_event: IpcMainInvokeEvent, recurring: RecurringTransactionInput) =>
-    database.saveRecurringTransaction(recurring),
+    withAlertRefresh(() => database.saveRecurringTransaction(recurring)),
   )
-  ipcMain.handle('recurring:delete', (_event: IpcMainInvokeEvent, id: string) => database.deleteRecurringTransaction(id))
-  ipcMain.handle('recurring:sync', () => database.syncRecurringTransactions())
+  ipcMain.handle('recurring:delete', (_event: IpcMainInvokeEvent, id: string) =>
+    withAlertRefresh(() => database.deleteRecurringTransaction(id)),
+  )
+  ipcMain.handle('recurring:sync', () => withAlertRefresh(() => database.syncRecurringTransactions()))
 
   ipcMain.handle('payee-rules:list', (_event: IpcMainInvokeEvent, search?: string) => database.getPayeeRules(search))
   ipcMain.handle('payee-rules:save', (_event: IpcMainInvokeEvent, rule: PayeeRuleInput) => database.upsertPayeeRule(rule))
@@ -329,14 +427,21 @@ function registerIpcHandlers() {
     database.previewTransactionCsvImport(request),
   )
   ipcMain.handle('transactions:import:commit', (_event: IpcMainInvokeEvent, request: CsvImportPreviewRequest) =>
-    database.commitTransactionCsvImport(request),
+    withAlertRefresh(() => database.commitTransactionCsvImport(request)),
   )
+  ipcMain.handle('csv-mappings:find', (_event: IpcMainInvokeEvent, headersKey: string) => database.findCsvImportMapping(headersKey))
+  ipcMain.handle('csv-mappings:save', (_event: IpcMainInvokeEvent, saved: SavedCsvMapping) => database.saveCsvImportMapping(saved))
 
   ipcMain.handle('dashboard:get', (_event: IpcMainInvokeEvent, period: Period) => database.getDashboardData(period))
-  ipcMain.handle('analytics:get', (_event: IpcMainInvokeEvent, period: Period) => database.getAnalyticsData(period))
-  ipcMain.handle('ai:analyze', (_event: IpcMainInvokeEvent, input: AnalyzeInsightsInput) =>
-    analyzeInsights(database, input.periodMonth, input.refresh),
-  )
+  ipcMain.handle('dashboard:forecast', () => database.getCashFlowForecast())
+  ipcMain.handle('analytics:get', (_event: IpcMainInvokeEvent, period: Period, monthOverMonthCount?: number) => database.getAnalyticsData(period, monthOverMonthCount))
+  ipcMain.handle('ai:analyze', (event: IpcMainInvokeEvent, input: AnalyzeInsightsInput) => {
+    const requestId = input.requestId ?? randomUUID()
+    return analyzeInsights(database, input.periodMonth, input.refresh, {
+      requestId,
+      onProgress: (progress) => sendAIInsightsProgress(event.sender, progress),
+    })
+  })
 
   ipcMain.handle('data:export-csv', () => exportTransactionsCsv())
 
@@ -442,9 +547,12 @@ app.whenReady().then(() => {
   database = new DatabaseManager(userDataPath)
   database.syncRecurringTransactions()
   snapshotsDir = path.join(userDataPath, 'snapshots')
+  alertsStatePath = path.join(userDataPath, 'alerts-state.json')
+  loadAlertState()
   Menu.setApplicationMenu(buildApplicationMenu())
   registerIpcHandlers()
   createWindow()
+  runAlertSweep()
 }).catch((error) => {
   const message = error instanceof Error ? error.message : String(error)
   const detail = message.includes('NODE_MODULE_VERSION')

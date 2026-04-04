@@ -28,7 +28,7 @@ describe('TransactionDialog', () => {
     expect(screen.getByText('Category')).toBeInTheDocument()
     expect(screen.queryByText('Income Type')).not.toBeInTheDocument()
 
-    fireEvent.click(screen.getByRole('button', { name: 'Income' }))
+    fireEvent.click(screen.getByRole('radio', { name: 'Income' }))
 
     expect(screen.getByText('Income Type')).toBeInTheDocument()
     expect(screen.queryByText('Category')).not.toBeInTheDocument()

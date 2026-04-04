@@ -1,7 +1,13 @@
-import { lazy, Suspense } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import { Navigate, Route, Routes } from 'react-router-dom'
+import type { AppSettings } from '../shared/types'
 import { AppShell } from '@/components/layout/AppShell'
+import { OnboardingWizard } from '@/components/onboarding/OnboardingWizard'
+import { Toaster } from '@/components/ui/sonner'
+import { TooltipProvider } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
+import { useCategories } from '@/hooks/useCategories'
+import { ipc } from '@/lib/ipc'
 
 const DashboardPage = lazy(async () => import('@/pages/Dashboard').then((module) => ({ default: module.DashboardPage })))
 const TransactionsPage = lazy(async () =>
@@ -17,7 +23,21 @@ const AIInsightsPage = lazy(async () =>
 const SettingsPage = lazy(async () => import('@/pages/Settings').then((module) => ({ default: module.SettingsPage })))
 
 function App() {
+  const categoryResult = useCategories()
+  const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [onboardingOpen, setOnboardingOpen] = useState(false)
+
+  useEffect(() => {
+    void ipc.getSettings().then((s) => {
+      setSettings(s)
+      if (s.onboardingCompleted !== 'true' && s.city === '' && s.country === '') {
+        setOnboardingOpen(true)
+      }
+    })
+  }, [])
+
   return (
+    <TooltipProvider delayDuration={400}>
     <AppShell>
       <Suspense
         fallback={
@@ -38,7 +58,17 @@ function App() {
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
       </Suspense>
+      {settings && (
+        <OnboardingWizard
+          open={onboardingOpen}
+          settings={settings}
+          categories={categoryResult.all}
+          onComplete={() => setOnboardingOpen(false)}
+        />
+      )}
     </AppShell>
+    <Toaster position="bottom-right" richColors closeButton />
+    </TooltipProvider>
   )
 }
 

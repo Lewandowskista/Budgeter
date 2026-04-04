@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { BarChart3, Receipt } from 'lucide-react'
 import {
   Area,
   AreaChart,
@@ -15,9 +16,11 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { useNavigate } from 'react-router-dom'
 import type { AnalyticsData, AppSettings, Period } from '../../shared/types'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { PageHeader } from '@/components/shared/PageHeader'
+import { ChartTooltip } from '@/components/shared/ChartTooltip'
 import { useReducedMotion } from '@/hooks/useReducedMotion'
 import { collectTrendCategories } from '../../shared/analytics'
 import { CATEGORY_COLORS } from '@/lib/constants'
@@ -26,19 +29,23 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { formatCurrency } from '@/lib/format'
 import { ipc } from '@/lib/ipc'
+import { useCategories } from '@/hooks/useCategories'
 
 export function AnalyticsPage() {
+  const navigate = useNavigate()
+  const categoryResult = useCategories()
   const [period, setPeriod] = useState<Period>('month')
   const [data, setData] = useState<AnalyticsData | null>(null)
   const [settings, setSettings] = useState<AppSettings | null>(null)
+  const [momCount, setMomCount] = useState(4)
   const prefersReducedMotion = useReducedMotion()
 
   useEffect(() => {
     void loadData()
-  }, [period])
+  }, [period, momCount])
 
   async function loadData() {
-    const [analytics, appSettings] = await Promise.all([ipc.getAnalyticsData(period), ipc.getSettings()])
+    const [analytics, appSettings] = await Promise.all([ipc.getAnalyticsData(period, momCount), ipc.getSettings()])
     setData(analytics)
     setSettings(appSettings)
   }
@@ -85,17 +92,23 @@ export function AnalyticsPage() {
                         nameKey="category"
                         innerRadius={70}
                         outerRadius={110}
+                        style={{ cursor: 'pointer' }}
+                        onClick={(entry) => navigate(`/transactions?category=${encodeURIComponent(entry.category)}`)}
                       >
                         {data.categoryBreakdown.map((entry) => (
                           <Cell key={entry.category} fill={entry.color} />
                         ))}
                       </Pie>
-                      <Tooltip formatter={formatTooltipValue} />
-                      <Legend />
+                      <Tooltip content={<ChartTooltip currency={settings?.currency ?? 'USD'} />} />
+                      <Legend
+                        wrapperStyle={{ fontFamily: 'var(--font-sans)', fontSize: '0.8125rem' }}
+                        iconType="circle"
+                        iconSize={8}
+                      />
                     </PieChart>
                   </ResponsiveContainer>
                 ) : (
-                  <EmptyState title="No chart data yet" description="Add transactions to populate category analytics." />
+                  <EmptyState icon={<BarChart3 />} title="No chart data yet" description="Add transactions to populate category analytics." />
                 )}
               </CardContent>
             </Card>
@@ -108,8 +121,19 @@ export function AnalyticsPage() {
               <CardContent className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={data.spendingTrend}>
-                    <XAxis dataKey="label" stroke="var(--color-muted-foreground)" />
-                    <YAxis stroke="var(--color-muted-foreground)" />
+                    <XAxis
+                      dataKey="label"
+                      stroke="var(--color-border)"
+                      tick={{ fill: 'var(--color-muted-foreground)', fontSize: 12, fontFamily: 'var(--font-sans)' }}
+                      tickLine={false}
+                      axisLine={false}
+                    />
+                    <YAxis
+                      stroke="var(--color-border)"
+                      tick={{ fill: 'var(--color-muted-foreground)', fontSize: 12, fontFamily: 'var(--font-sans)' }}
+                      tickLine={false}
+                      axisLine={false}
+                    />
                     <Tooltip formatter={formatTooltipValue} />
                     <Legend />
                     <Line isAnimationActive={!prefersReducedMotion} type="monotone" dataKey="spent" stroke="var(--color-primary)" strokeWidth={3} />
@@ -129,8 +153,19 @@ export function AnalyticsPage() {
               <CardContent className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={data.categoryTrends}>
-                    <XAxis dataKey="label" stroke="var(--color-muted-foreground)" />
-                    <YAxis stroke="var(--color-muted-foreground)" />
+                    <XAxis
+                      dataKey="label"
+                      stroke="var(--color-border)"
+                      tick={{ fill: 'var(--color-muted-foreground)', fontSize: 12, fontFamily: 'var(--font-sans)' }}
+                      tickLine={false}
+                      axisLine={false}
+                    />
+                    <YAxis
+                      stroke="var(--color-border)"
+                      tick={{ fill: 'var(--color-muted-foreground)', fontSize: 12, fontFamily: 'var(--font-sans)' }}
+                      tickLine={false}
+                      axisLine={false}
+                    />
                     <Tooltip formatter={formatTooltipValue} />
                     <Legend />
                     {visibleCategories.map((category) => (
@@ -140,8 +175,8 @@ export function AnalyticsPage() {
                         type="monotone"
                         dataKey={category}
                         stackId="stack"
-                        stroke={CATEGORY_COLORS[category] ?? CATEGORY_COLORS.Other}
-                        fill={CATEGORY_COLORS[category] ?? CATEGORY_COLORS.Other}
+                        stroke={categoryResult.colors[category] ?? CATEGORY_COLORS.Other}
+                        fill={categoryResult.colors[category] ?? CATEGORY_COLORS.Other}
                       />
                     ))}
                   </AreaChart>
@@ -151,14 +186,37 @@ export function AnalyticsPage() {
 
             <Card className="border-border/80 bg-card/90">
               <CardHeader>
-                <CardTitle>Month-over-month comparison</CardTitle>
-                <CardDescription>Grouped bars for the latest four months.</CardDescription>
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <CardTitle>Month-over-month comparison</CardTitle>
+                    <CardDescription>Grouped bars for the latest {momCount} months.</CardDescription>
+                  </div>
+                  <Tabs value={String(momCount)} onValueChange={(v) => setMomCount(Number(v))}>
+                    <TabsList>
+                      <TabsTrigger value="3">3m</TabsTrigger>
+                      <TabsTrigger value="4">4m</TabsTrigger>
+                      <TabsTrigger value="6">6m</TabsTrigger>
+                      <TabsTrigger value="12">12m</TabsTrigger>
+                    </TabsList>
+                  </Tabs>
+                </div>
               </CardHeader>
               <CardContent className="h-80">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={data.monthOverMonth}>
-                    <XAxis dataKey="label" stroke="var(--color-muted-foreground)" />
-                    <YAxis stroke="var(--color-muted-foreground)" />
+                    <XAxis
+                      dataKey="label"
+                      stroke="var(--color-border)"
+                      tick={{ fill: 'var(--color-muted-foreground)', fontSize: 12, fontFamily: 'var(--font-sans)' }}
+                      tickLine={false}
+                      axisLine={false}
+                    />
+                    <YAxis
+                      stroke="var(--color-border)"
+                      tick={{ fill: 'var(--color-muted-foreground)', fontSize: 12, fontFamily: 'var(--font-sans)' }}
+                      tickLine={false}
+                      axisLine={false}
+                    />
                     <Tooltip formatter={formatTooltipValue} />
                     <Legend />
                     <Bar isAnimationActive={!prefersReducedMotion} dataKey="spent" fill="var(--color-primary)" radius={[8, 8, 0, 0]} />
@@ -181,7 +239,13 @@ export function AnalyticsPage() {
                     <XAxis type="number" stroke="var(--color-muted-foreground)" />
                     <YAxis dataKey="category" type="category" width={120} stroke="var(--color-muted-foreground)" />
                     <Tooltip formatter={formatTooltipValue} />
-                    <Bar isAnimationActive={!prefersReducedMotion} dataKey="amount" radius={[0, 10, 10, 0]}>
+                    <Bar
+                      isAnimationActive={!prefersReducedMotion}
+                      dataKey="amount"
+                      radius={[0, 10, 10, 0]}
+                      style={{ cursor: 'pointer' }}
+                      onClick={(entry) => navigate(`/transactions?category=${encodeURIComponent(entry.category)}`)}
+                    >
                       {data.categoryBreakdown.map((entry) => (
                         <Cell key={entry.category} fill={entry.color} />
                       ))}
@@ -198,29 +262,38 @@ export function AnalyticsPage() {
               </CardHeader>
               <CardContent className="space-y-3">
                 {data.topExpenses.length ? (
-                  data.topExpenses.map((expense) => (
-                    <div key={expense.id} className="space-y-2 rounded-2xl border border-border/70 bg-muted/30 px-4 py-3">
-                      <div className="flex items-center justify-between gap-4">
-                        <div>
-                          <p className="font-medium text-foreground">{expense.category}</p>
-                          <p className="text-sm text-muted-foreground">
-                            {expense.note || 'No note'} - {expense.date}
-                          </p>
+                  data.topExpenses.map((expense) => {
+                    const searchTerm = expense.note || expense.payee || expense.category
+                    const href = `/transactions?search=${encodeURIComponent(searchTerm ?? '')}&category=${encodeURIComponent(expense.category ?? '')}`
+                    return (
+                      <a
+                        key={expense.id}
+                        href={`#${href}`}
+                        className="block space-y-2 rounded-2xl border border-border/70 bg-muted/30 px-4 py-3 transition-colors hover:bg-muted/50"
+                        onClick={(e) => { e.preventDefault(); navigate(href) }}
+                      >
+                        <div className="flex items-center justify-between gap-4">
+                          <div>
+                            <p className="font-medium text-foreground">{expense.category}</p>
+                            <p className="text-sm text-muted-foreground">
+                              {expense.note || 'No note'} - {expense.date}
+                            </p>
+                          </div>
+                          <p className="font-medium text-foreground">{formatCurrency(expense.amount, currency)}</p>
                         </div>
-                        <p className="font-medium text-foreground">{formatCurrency(expense.amount, currency)}</p>
-                      </div>
-                      <div className="h-2 rounded-full bg-muted">
-                        <div
-                          className="h-2 rounded-full bg-primary"
-                          style={{
-                            width: `${(expense.amount / Math.max(data.topExpenses[0]?.amount ?? expense.amount, 1)) * 100}%`,
-                          }}
-                        />
-                      </div>
-                    </div>
-                  ))
+                        <div className="h-2 rounded-full bg-muted">
+                          <div
+                            className="h-2 rounded-full bg-primary"
+                            style={{
+                              width: `${(expense.amount / Math.max(data.topExpenses[0]?.amount ?? expense.amount, 1)) * 100}%`,
+                            }}
+                          />
+                        </div>
+                      </a>
+                    )
+                  })
                 ) : (
-                  <EmptyState title="No top expenses yet" description="Expense transactions will surface here automatically." />
+                  <EmptyState icon={<Receipt />} title="No top expenses yet" description="Expense transactions will surface here automatically." />
                 )}
               </CardContent>
             </Card>

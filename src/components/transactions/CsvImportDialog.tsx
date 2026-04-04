@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
-import type { CsvImportFile, CsvImportPreviewRequest, CsvImportPreviewResult, TransactionType } from '../../../shared/types'
+import type { CsvImportFile, CsvImportPreviewRequest, CsvImportPreviewResult, SavedCsvMapping, TransactionType } from '../../../shared/types'
+import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import {
   Dialog,
@@ -12,6 +13,13 @@ import {
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { ipc } from '@/lib/ipc'
+
+function computeHeadersKey(headers: string[]): string {
+  return headers
+    .map((h) => h.trim().toLowerCase())
+    .sort()
+    .join('|')
+}
 
 interface CsvImportDialogProps {
   open: boolean
@@ -36,6 +44,8 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
   const [learnRules, setLearnRules] = useState(true)
   const [preview, setPreview] = useState<CsvImportPreviewResult | null>(null)
   const [saving, setSaving] = useState(false)
+  const [savedMapping, setSavedMapping] = useState<SavedCsvMapping | null>(null)
+  const [savedMappingDismissed, setSavedMappingDismissed] = useState(false)
 
   const canPreview = Boolean(file && dateColumn && amountColumn)
   const request = useMemo<CsvImportPreviewRequest | null>(() => {
@@ -74,6 +84,22 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
     setDefaultExpenseType('expense')
     setLearnRules(true)
     setPreview(null)
+    setSavedMapping(null)
+    setSavedMappingDismissed(false)
+  }
+
+  function applySavedMapping(saved: SavedCsvMapping, fileHeaders: string[]) {
+    const m = saved.mapping
+    // Only apply column values that still exist in the current file's headers
+    if (fileHeaders.includes(m.date)) setDateColumn(m.date)
+    if (fileHeaders.includes(m.amount)) setAmountColumn(m.amount)
+    setTypeColumn(m.type && fileHeaders.includes(m.type) ? m.type : '__none__')
+    setCategoryColumn(m.category && fileHeaders.includes(m.category) ? m.category : '__none__')
+    setIncomeSourceColumn(m.incomeSource && fileHeaders.includes(m.incomeSource) ? m.incomeSource : '__none__')
+    setPayeeColumn(m.payee && fileHeaders.includes(m.payee) ? m.payee : '__none__')
+    setNoteColumn(m.note && fileHeaders.includes(m.note) ? m.note : '__none__')
+    setAmountMode(saved.amountMode)
+    setDefaultExpenseType(saved.defaultExpenseType)
   }
 
   async function chooseFile() {
@@ -83,6 +109,17 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
     }
 
     setFile(selected)
+    setSavedMappingDismissed(false)
+
+    const key = computeHeadersKey(selected.headers)
+    const found = await ipc.findCsvImportMapping(key)
+    if (found) {
+      setSavedMapping(found)
+      applySavedMapping(found, selected.headers)
+    } else {
+      setSavedMapping(null)
+    }
+
     setStep('map')
   }
 
@@ -97,16 +134,36 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
   }
 
   async function commit() {
-    if (!request) {
+    if (!request || !file) {
       return
     }
 
     setSaving(true)
     try {
-      await ipc.commitTransactionCsvImport(request)
+      const result = await ipc.commitTransactionCsvImport(request)
+
+      // Persist the column mapping for next time this CSV format is used
+      const headersKey = computeHeadersKey(file.headers)
+      const now = new Date().toISOString()
+      await ipc.saveCsvImportMapping({
+        id: savedMapping?.id ?? crypto.randomUUID(),
+        headersKey,
+        mapping: request.mapping,
+        amountMode: request.amountMode,
+        defaultExpenseType: request.defaultExpenseType,
+        createdAt: savedMapping?.createdAt ?? now,
+        updatedAt: now,
+      })
+
       await onComplete()
       onOpenChange(false)
       reset()
+
+      const parts: string[] = [`${result.insertedCount} imported`]
+      if (result.skippedDuplicateCount > 0) parts.push(`${result.skippedDuplicateCount} duplicates skipped`)
+      if (result.invalidCount > 0) parts.push(`${result.invalidCount} invalid`)
+      if ((result.pendingReviewCount ?? 0) > 0) parts.push(`${result.pendingReviewCount} need review`)
+      toast.success('CSV import complete', { description: parts.join(' · ') })
     } finally {
       setSaving(false)
     }
@@ -142,6 +199,30 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
             <div className="rounded-2xl border border-border/80 bg-muted/20 px-4 py-3 text-sm text-muted-foreground">
               Selected file: <span className="font-medium text-foreground">{file.fileName}</span>
             </div>
+
+            {savedMapping && !savedMappingDismissed ? (
+              <div className="flex items-center justify-between gap-3 rounded-2xl border border-primary/40 bg-primary/8 px-4 py-3 text-sm">
+                <p className="text-foreground">Saved mapping found for this file format — columns have been pre-filled.</p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setSavedMappingDismissed(true)
+                    setDateColumn('')
+                    setAmountColumn('')
+                    setTypeColumn('__none__')
+                    setCategoryColumn('__none__')
+                    setIncomeSourceColumn('__none__')
+                    setPayeeColumn('__none__')
+                    setNoteColumn('__none__')
+                    setAmountMode('signed')
+                    setDefaultExpenseType('expense')
+                  }}
+                >
+                  Start fresh
+                </Button>
+              </div>
+            ) : null}
 
             <div className="grid gap-4 sm:grid-cols-2">
               <ColumnSelect label="Date column" headers={file.headers} value={dateColumn} onChange={setDateColumn} />
@@ -200,6 +281,7 @@ export function CsvImportDialog({ open, onOpenChange, onComplete }: CsvImportDia
             </div>
             <div className="max-h-[26rem] overflow-auto rounded-2xl border border-border/80">
               <Table>
+                <caption className="sr-only">CSV import preview</caption>
                 <TableHeader>
                   <TableRow>
                     <TableHead>Row</TableHead>

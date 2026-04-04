@@ -48,6 +48,7 @@ describe('validateBudgetInput', () => {
         category: 'Food & Dining',
         amount: 0,
         month: '2026-04',
+        rolloverEnabled: false,
       }),
     ).toEqual({ amount: 'Enter a budget greater than 0.' })
   })

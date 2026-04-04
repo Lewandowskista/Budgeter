@@ -28,6 +28,8 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-surface: var(--surface);
+  --color-income: var(--income);
+  --color-income-foreground: var(--income-foreground);
   --color-chart-food: var(--chart-food);
   --color-chart-housing: var(--chart-housing);
   --color-chart-transport: var(--chart-transport);
@@ -68,18 +70,20 @@
   --card-foreground: #2d2d2a;
   --popover: #ffffff;
   --popover-foreground: #2d2d2a;
-  --primary: #4a6741;
-  --primary-foreground: #f7f8f4;
+  --primary: #3d5c35;
+  --primary-foreground: #f2f7f0;
   --secondary: #6b8f63;
   --secondary-foreground: #f8faf6;
-  --accent: #b08d57;
-  --accent-foreground: #1f1d19;
+  --accent: #8a6a35;
+  --accent-foreground: #fdf8f0;
   --muted: #f3f1ec;
-  --muted-foreground: #7a7a72;
+  --muted-foreground: #6b6b63;
   --destructive: #c2553a;
   --destructive-foreground: #fff8f5;
-  --border: #e8e6e1;
-  --input: #e8e6e1;
+  --border: #dedad4;
+  --input: #dedad4;
+  --income: #3a7d44;
+  --income-foreground: #f0faf2;
   --ring: #6b8f63;
   --surface: #f3f1ec;
   --radius: 1rem;
@@ -115,7 +119,7 @@
   color-scheme: dark;
   --background: #1a1a18;
   --foreground: #ededea;
-  --card: #2a2a26;
+  --card: #252522;
   --card-foreground: #ededea;
   --popover: #2a2a26;
   --popover-foreground: #ededea;
@@ -129,8 +133,10 @@
   --muted-foreground: #9a9a92;
   --destructive: #db7157;
   --destructive-foreground: #fff8f5;
-  --border: rgba(255, 252, 245, 0.08);
-  --input: rgba(255, 252, 245, 0.12);
+  --border: rgba(255, 252, 245, 0.12);
+  --input: rgba(255, 252, 245, 0.16);
+  --income: #52a55f;
+  --income-foreground: #0f1f14;
   --ring: #7baf71;
   --surface: #232320;
   --chart-1: #d4944a;
@@ -231,8 +237,40 @@ h4 {
   }
 }
 
+.stagger-in > * {
+  animation: page-in 280ms ease-out both;
+}
+
+.stagger-in > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+
+.stagger-in > *:nth-child(2) {
+  animation-delay: 40ms;
+}
+
+.stagger-in > *:nth-child(3) {
+  animation-delay: 80ms;
+}
+
+.stagger-in > *:nth-child(4) {
+  animation-delay: 120ms;
+}
+
+.stagger-in > *:nth-child(5) {
+  animation-delay: 160ms;
+}
+
+.stagger-in > *:nth-child(6) {
+  animation-delay: 200ms;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .page-transition {
+    animation: none;
+  }
+
+  .stagger-in > * {
     animation: none;
   }
 }

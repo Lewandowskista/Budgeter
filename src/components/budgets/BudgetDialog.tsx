@@ -20,11 +20,14 @@ interface BudgetDialogProps {
   budget?: BudgetProgress | null
   onOpenChange: (open: boolean) => void
   onSubmit: (budget: BudgetInput) => Promise<void>
+  categories?: string[]
 }
 
-export function BudgetDialog({ open, month, budget, onOpenChange, onSubmit }: BudgetDialogProps) {
-  const [category, setCategory] = useState<string>(BUDGET_CATEGORIES[0])
+export function BudgetDialog({ open, month, budget, onOpenChange, onSubmit, categories = [...BUDGET_CATEGORIES] }: BudgetDialogProps) {
+  const defaultCategory = categories[0] ?? BUDGET_CATEGORIES[0]
+  const [category, setCategory] = useState<string>(defaultCategory)
   const [amount, setAmount] = useState('')
+  const [rolloverEnabled, setRolloverEnabled] = useState(false)
   const [saving, setSaving] = useState(false)
   const [errors, setErrors] = useState<ValidationErrors>({})
 
@@ -32,11 +35,13 @@ export function BudgetDialog({ open, month, budget, onOpenChange, onSubmit }: Bu
     if (budget) {
       setCategory(budget.category)
       setAmount(String(budget.amount))
+      setRolloverEnabled(budget.rolloverEnabled)
       return
     }
 
-    setCategory(BUDGET_CATEGORIES[0])
+    setCategory(defaultCategory)
     setAmount('')
+    setRolloverEnabled(false)
     setErrors({})
   }, [budget, open])
 
@@ -46,6 +51,7 @@ export function BudgetDialog({ open, month, budget, onOpenChange, onSubmit }: Bu
       category,
       amount: Number(amount),
       month,
+      rolloverEnabled,
     })
     setErrors(nextErrors)
 
@@ -59,6 +65,7 @@ export function BudgetDialog({ open, month, budget, onOpenChange, onSubmit }: Bu
         category,
         amount: Number(amount),
         month,
+        rolloverEnabled,
       })
       onOpenChange(false)
     } finally {
@@ -82,7 +89,7 @@ export function BudgetDialog({ open, month, budget, onOpenChange, onSubmit }: Bu
                 <SelectValue placeholder="Select category" />
               </SelectTrigger>
               <SelectContent>
-                {BUDGET_CATEGORIES.map((value) => (
+                {categories.map((value) => (
                   <SelectItem key={value} value={value}>
                     {value}
                   </SelectItem>
@@ -114,6 +121,16 @@ export function BudgetDialog({ open, month, budget, onOpenChange, onSubmit }: Bu
           <label className="grid gap-2 text-sm font-medium text-foreground">
             Month
             <Input required type="month" value={month} readOnly />
+          </label>
+
+          <label className="flex items-center gap-2 text-sm text-muted-foreground">
+            <input
+              checked={rolloverEnabled}
+              className="focus-ring size-4 rounded border border-input"
+              type="checkbox"
+              onChange={(event) => setRolloverEnabled(event.target.checked)}
+            />
+            Roll unused or overspent balance into the next month
           </label>
 
           <DialogFooter className="border-t-0 bg-transparent p-0">

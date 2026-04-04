@@ -1,21 +1,14 @@
 import { useEffect, useState } from 'react'
-import { Plus, Trash2 } from 'lucide-react'
+import { LayoutTemplate, PiggyBank, Plus, Trash2 } from 'lucide-react'
+import { toast } from 'sonner'
 import type { AppSettings, BudgetInput, BudgetProgress, BudgetTemplate, BudgetTemplateInput, BudgetsPayload } from '../../shared/types'
 import { BudgetDialog } from '@/components/budgets/BudgetDialog'
 import { BudgetTemplateDialog } from '@/components/budgets/BudgetTemplateDialog'
+import { BudgetAlertBanner } from '@/components/shared/BudgetAlertBanner'
 import { CircularGauge } from '@/components/shared/CircularGauge'
 import { EmptyState } from '@/components/shared/EmptyState'
 import { PageHeader } from '@/components/shared/PageHeader'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
@@ -23,8 +16,10 @@ import { Progress } from '@/components/ui/progress'
 import { Skeleton } from '@/components/ui/skeleton'
 import { currentMonthValue, formatCurrency } from '@/lib/format'
 import { ipc } from '@/lib/ipc'
+import { useCategories } from '@/hooks/useCategories'
 
 export function BudgetsPage() {
+  const categoryResult = useCategories()
   const [month, setMonth] = useState(currentMonthValue())
   const [payload, setPayload] = useState<BudgetsPayload | null>(null)
   const [settings, setSettings] = useState<AppSettings | null>(null)
@@ -33,7 +28,6 @@ export function BudgetsPage() {
   const [templateDialogOpen, setTemplateDialogOpen] = useState(false)
   const [editingBudget, setEditingBudget] = useState<BudgetProgress | null>(null)
   const [editingTemplate, setEditingTemplate] = useState<BudgetTemplate | null>(null)
-  const [pendingDeleteBudget, setPendingDeleteBudget] = useState<BudgetProgress | null>(null)
 
   useEffect(() => {
     void loadBudgets()
@@ -53,33 +47,61 @@ export function BudgetsPage() {
   async function saveBudget(budget: BudgetInput) {
     await ipc.setBudget(budget)
     await loadBudgets()
+    toast.success(editingBudget ? 'Budget updated' : 'Budget set')
   }
 
   async function removeBudget(budget: BudgetProgress) {
-    const next = await ipc.deleteBudget(budget.id, month)
-    setPayload(next)
     setPendingDeleteBudget(null)
+    // Optimistically remove from UI
+    if (payload) {
+      setPayload({ ...payload, budgets: payload.budgets.filter((b) => b.id !== budget.id) })
+    }
+    toast(`${budget.category} budget removed`, {
+      action: {
+        label: 'Undo',
+        onClick: () => void loadBudgets(),
+      },
+      duration: 5000,
+      onAutoClose: () => void ipc.deleteBudget(budget.id, month).then(() => loadBudgets()),
+      onDismiss: () => void ipc.deleteBudget(budget.id, month).then(() => loadBudgets()),
+    })
   }
 
   async function saveBudgetTemplate(template: BudgetTemplateInput) {
     await ipc.saveBudgetTemplate(template)
     await loadBudgets()
+    toast.success(editingTemplate ? 'Template updated' : 'Template saved')
   }
 
   async function removeTemplate(template: BudgetTemplate) {
     await ipc.deleteBudgetTemplate(template.id)
     await loadBudgets()
+    toast.success(`${template.category} template removed`)
   }
 
   async function applyTemplates() {
     const next = await ipc.applyBudgetTemplates(month)
     setPayload(next)
     setTemplates(await ipc.getBudgetTemplates())
+    toast.success('Templates applied')
+  }
+
+  async function copyFromPreviousMonth() {
+    const next = await ipc.copyBudgetsFromPreviousMonth(month)
+    setPayload(next)
+    toast.success('Budgets copied from previous month')
+  }
+
+  function prevMonthLabel(currentMonth: string) {
+    const [year, m] = currentMonth.split('-').map(Number)
+    const prev = new Date(Date.UTC(year, m - 2, 1))
+    return prev.toLocaleDateString(undefined, { month: 'short', year: 'numeric' })
   }
 
   async function saveMonthAsTemplates() {
     await ipc.saveMonthAsBudgetTemplates(month)
     await loadBudgets()
+    toast.success('Month saved as templates')
   }
 
   const currency = settings?.currency ?? 'USD'
@@ -88,7 +110,7 @@ export function BudgetsPage() {
     <div className="space-y-6">
       <PageHeader
         title="Budgets"
-        description="Set monthly limits per category and watch them update automatically against live spending."
+        description="Set monthly limits per category, carry balances forward when needed, and watch the available-to-spend view update live."
         action={
           <div className="flex flex-wrap items-center gap-3">
             <input
@@ -98,6 +120,9 @@ export function BudgetsPage() {
               value={month}
               onChange={(event) => setMonth(event.target.value)}
             />
+            <Button variant="outline" onClick={() => void copyFromPreviousMonth()}>
+              Copy + roll from {prevMonthLabel(month)}
+            </Button>
             <Button
               variant="outline"
               onClick={() => {
@@ -122,10 +147,12 @@ export function BudgetsPage() {
 
       {payload ? (
         <>
+          <BudgetAlertBanner budgets={payload.budgets} />
+
           <Card className="border-border/80 bg-card/90">
             <CardHeader>
               <CardTitle>Overall budget health</CardTitle>
-              <CardDescription>Total spend versus total planned amount for {month}.</CardDescription>
+              <CardDescription>Total spend versus total available-to-spend amount for {month}, including rollover.</CardDescription>
             </CardHeader>
             <CardContent className="flex flex-col gap-6 lg:flex-row lg:items-center lg:justify-between">
               <div className="flex items-center justify-center">
@@ -148,7 +175,7 @@ export function BudgetsPage() {
                     {payload.overview.totalBudget > 0 ? payload.overview.percentage.toFixed(0) : '0'}%
                   </p>
                   <p className="text-sm text-muted-foreground">
-                    {formatCurrency(payload.overview.totalSpent, currency)} spent of {formatCurrency(payload.overview.totalBudget, currency)}
+                    {formatCurrency(payload.overview.totalSpent, currency)} spent of {formatCurrency(payload.overview.totalAvailable, currency)} available
                   </p>
                 </div>
                 <Badge variant={payload.overview.percentage >= 100 ? 'destructive' : 'secondary'}>
@@ -168,7 +195,7 @@ export function BudgetsPage() {
                       <div>
                         <CardTitle>{budget.category}</CardTitle>
                         <CardDescription>
-                          {formatCurrency(budget.spent, currency)} spent of {formatCurrency(budget.amount, currency)}
+                          {formatCurrency(budget.spent, currency)} spent of {formatCurrency(budget.availableToSpend, currency)} available
                         </CardDescription>
                       </div>
                       <Badge
@@ -185,11 +212,23 @@ export function BudgetsPage() {
                     </div>
                   </CardHeader>
                   <CardContent className="space-y-4">
-                    <Progress value={Math.min(budget.percentage, 100)} className="h-3" />
+                    <Progress
+                      value={Math.min(budget.percentage, 100)}
+                      className={cn(
+                        'h-3',
+                        budget.status === 'danger' && '[&>div]:bg-destructive',
+                        budget.status === 'warning' && '[&>div]:bg-accent',
+                      )}
+                    />
                     <div className="flex items-center justify-between text-sm text-muted-foreground">
                       <span>{budget.percentage.toFixed(0)}% used</span>
                       <span>{formatCurrency(budget.remaining, currency)} remaining</span>
                     </div>
+                    {budget.rolloverEnabled ? (
+                      <div className="rounded-2xl border border-border/70 bg-muted/20 px-3 py-2 text-sm text-muted-foreground">
+                        Carryover: {formatCurrency(budget.carryoverAmount, currency)} · Base budget: {formatCurrency(budget.amount, currency)}
+                      </div>
+                    ) : null}
                     <div className="flex justify-between gap-2">
                       <Button
                         variant="outline"
@@ -200,7 +239,7 @@ export function BudgetsPage() {
                       >
                         Edit
                       </Button>
-                      <Button variant="ghost" onClick={() => setPendingDeleteBudget(budget)}>
+                      <Button variant="ghost" onClick={() => void removeBudget(budget)}>
                         <Trash2 data-icon="inline-start" />
                         Remove
                       </Button>
@@ -211,6 +250,7 @@ export function BudgetsPage() {
             </section>
           ) : (
             <EmptyState
+              icon={<PiggyBank />}
               title="No budgets set for this month"
               description="Start with a few core categories like rent, food, and transport to see live progress bars."
               action={<Button onClick={() => setDialogOpen(true)}>Create first budget</Button>}
@@ -250,8 +290,9 @@ export function BudgetsPage() {
                       <p className="font-medium text-foreground">{template.category}</p>
                       <p className="text-sm text-muted-foreground">{formatCurrency(template.amount, currency)}</p>
                     </div>
-                    <div className="flex flex-wrap items-center gap-2">
-                      <Badge variant={template.active ? 'secondary' : 'outline'}>{template.active ? 'Active' : 'Paused'}</Badge>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {template.rolloverEnabled ? <Badge variant="outline">Rollover</Badge> : null}
+                    <Badge variant={template.active ? 'secondary' : 'outline'}>{template.active ? 'Active' : 'Paused'}</Badge>
                       <Button
                         variant="outline"
                         size="sm"
@@ -269,7 +310,7 @@ export function BudgetsPage() {
                   </div>
                 ))
               ) : (
-                <EmptyState title="No budget templates yet" description="Create a few reusable templates to prefill future months." />
+                <EmptyState icon={<LayoutTemplate />} title="No budget templates yet" description="Create a few reusable templates to prefill future months." />
               )}
             </CardContent>
           </Card>
@@ -297,6 +338,7 @@ export function BudgetsPage() {
           if (!open) setEditingBudget(null)
         }}
         onSubmit={saveBudget}
+        categories={categoryResult.all}
       />
 
       <BudgetTemplateDialog
@@ -309,25 +351,6 @@ export function BudgetsPage() {
         onSubmit={saveBudgetTemplate}
       />
 
-      <AlertDialog open={Boolean(pendingDeleteBudget)} onOpenChange={(open) => !open && setPendingDeleteBudget(null)}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete this budget?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This removes the {pendingDeleteBudget?.category ?? 'selected'} budget for {month}. Your transactions stay in place.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              variant="destructive"
-              onClick={() => pendingDeleteBudget && removeBudget(pendingDeleteBudget)}
-            >
-              Delete budget
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   )
 }

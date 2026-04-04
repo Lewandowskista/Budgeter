@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import Database from 'better-sqlite3'
-import { BUDGET_CATEGORIES, CATEGORY_COLORS, DEFAULT_SETTINGS, INCOME_SOURCES, SETTINGS_KEYS } from '../shared/constants'
+import { BUDGET_CATEGORIES, CATEGORY_COLORS, CUSTOM_CATEGORY_PALETTE, DEFAULT_SETTINGS, INCOME_SOURCES, SETTINGS_KEYS } from '../shared/constants'
 import { normalizeFreeformText, normalizePayee } from '../shared/payees'
 import { sanitizeSettingsForSnapshot } from '../shared/snapshot'
 import type {
@@ -16,17 +16,26 @@ import type {
   BudgetTemplate,
   BudgetTemplateInput,
   BudgetsPayload,
+  CashFlowForecast,
   CategorySpendDatum,
   CategoryTrendDatum,
+  CategoryListResult,
+  CsvImportAmountMode,
   CsvImportCommitSummary,
+  CsvImportMapping,
+  CustomCategory,
+  CustomCategoryInput,
   CsvImportPreviewRequest,
   CsvImportPreviewResult,
   CsvImportPreviewRow,
+  SavedCsvMapping,
   DashboardData,
   IncomeSource,
+  UpcomingBill,
   PayeeRule,
   PayeeRuleInput,
   Period,
+  RecurringPostingMode,
   RecurringSyncSummary,
   RecurringTransaction,
   RecurringTransactionInput,
@@ -35,14 +44,20 @@ import type {
   Transaction,
   TransactionFilters,
   TransactionInput,
+  TransactionOrigin,
+  TransactionReviewStatus,
   TransactionSortField,
   TransactionType,
   TrendDatum,
 } from '../shared/types'
 import { parseCsv, readCsvFile } from './csv'
 
+// Categories that represent saving/transferring money rather than spending.
+// Excluded from "Total Spent" and pie charts so they don't distort spending stats.
+const SAVINGS_CATEGORIES = new Set(['Savings'])
+
 type SettingsRow = { key: keyof AppSettings; value: string }
-type BudgetRow = { id: string; category: string; amount: number; month: string }
+type BudgetRow = { id: string; category: string; amount: number; month: string; rollover_enabled: number }
 type CacheRow = { key: string; payload: string; created_at: string }
 type TransactionRow = {
   id: string
@@ -53,6 +68,8 @@ type TransactionRow = {
   payee: string | null
   date: string
   note: string | null
+  review_status: TransactionReviewStatus
+  origin: TransactionOrigin
   recurring_transaction_id: string | null
   created_at: string
 }
@@ -68,6 +85,10 @@ type RecurringTransactionRow = {
   start_month: string
   last_posted_month: string | null
   active: number
+  posting_mode: RecurringPostingMode
+  expected_amount: number | null
+  reminder_days: number
+  subscription_label: string | null
   created_at: string
   updated_at: string
 }
@@ -76,6 +97,7 @@ type BudgetTemplateRow = {
   category: string
   amount: number
   active: number
+  rollover_enabled: number
   created_at: string
   updated_at: string
 }
@@ -97,6 +119,12 @@ interface PeriodBucket {
 interface TableColumnInfo {
   name: string
   notnull: number
+}
+
+interface RecurringDueCandidate {
+  row: RecurringTransactionRow
+  dueDate: string
+  isGap: boolean
 }
 
 export class DatabaseManager {
@@ -125,6 +153,8 @@ export class DatabaseManager {
         payee TEXT,
         date TEXT NOT NULL,
         note TEXT,
+        review_status TEXT NOT NULL DEFAULT 'reviewed',
+        origin TEXT NOT NULL DEFAULT 'manual',
         recurring_transaction_id TEXT,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
       );
@@ -134,6 +164,7 @@ export class DatabaseManager {
         category TEXT NOT NULL,
         amount REAL NOT NULL CHECK(amount > 0),
         month TEXT NOT NULL,
+        rollover_enabled INTEGER NOT NULL DEFAULT 0,
         UNIQUE(category, month)
       );
 
@@ -160,6 +191,10 @@ export class DatabaseManager {
         start_month TEXT NOT NULL,
         last_posted_month TEXT,
         active INTEGER NOT NULL DEFAULT 1,
+        posting_mode TEXT NOT NULL DEFAULT 'auto',
+        expected_amount REAL,
+        reminder_days INTEGER NOT NULL DEFAULT 3,
+        subscription_label TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -169,6 +204,7 @@ export class DatabaseManager {
         category TEXT NOT NULL UNIQUE,
         amount REAL NOT NULL CHECK(amount > 0),
         active INTEGER NOT NULL DEFAULT 1,
+        rollover_enabled INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
@@ -181,9 +217,29 @@ export class DatabaseManager {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS csv_import_mappings (
+        id TEXT PRIMARY KEY,
+        headers_key TEXT NOT NULL UNIQUE,
+        mapping TEXT NOT NULL,
+        amount_mode TEXT NOT NULL,
+        default_expense_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS custom_categories (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        color TEXT NOT NULL,
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
     `)
     this.migrateTransactionsTable()
+    this.migrateBudgetsTable()
     this.migrateRecurringTransactionsTable()
+    this.migrateBudgetTemplatesTable()
     this.createTransactionIndexes()
     this.seedDefaultSettings()
   }
@@ -222,6 +278,34 @@ export class DatabaseManager {
     return this.queryTransactions(filters)
   }
 
+  getPendingReviewTransactions(): Transaction[] {
+    const rows = this.db
+      .prepare(`
+        SELECT id, amount, type, category, income_source, payee, date, note, review_status, origin, recurring_transaction_id, created_at
+        FROM transactions
+        WHERE review_status = 'pending'
+        ORDER BY date ASC, created_at ASC
+      `)
+      .all() as TransactionRow[]
+
+    return rows.map(mapTransactionRow)
+  }
+
+  markTransactionsReviewed(ids: string[]): Transaction[] {
+    if (!ids.length) {
+      return []
+    }
+
+    const update = this.db.prepare('UPDATE transactions SET review_status = ? WHERE id = ?')
+    this.db.transaction((items: string[]) => {
+      for (const id of items) {
+        update.run('reviewed', id)
+      }
+    })(ids)
+
+    return this.queryTransactions({ reviewStatus: 'reviewed' }).filter((transaction) => ids.includes(transaction.id))
+  }
+
   private queryTransactions(filters: TransactionFilters = {}): Transaction[] {
     const clauses: string[] = []
     const params: Record<string, unknown> = {}
@@ -241,6 +325,16 @@ export class DatabaseManager {
     if (filters.type && filters.type !== 'all') {
       clauses.push('type = @type')
       params.type = filters.type
+    }
+
+    if (filters.reviewStatus && filters.reviewStatus !== 'all') {
+      clauses.push('review_status = @reviewStatus')
+      params.reviewStatus = filters.reviewStatus
+    }
+
+    if (filters.origin && filters.origin !== 'all') {
+      clauses.push('origin = @origin')
+      params.origin = filters.origin
     }
 
     if (filters.incomeSource && filters.incomeSource !== 'all' && filters.type !== 'expense') {
@@ -271,13 +365,17 @@ export class DatabaseManager {
     const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : ''
     const sortColumn = getTransactionSortColumn(filters.sortBy)
     const sortDirection = filters.sortDirection === 'asc' ? 'ASC' : 'DESC'
+    const limit = filters.limit ?? 0
+    const offset = filters.offset ?? 0
+    const pagination = limit > 0 ? `LIMIT ${limit} OFFSET ${offset}` : ''
     const rows = this.db
       .prepare(
         `
-          SELECT id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at
+          SELECT id, amount, type, category, income_source, payee, date, note, review_status, origin, recurring_transaction_id, created_at
           FROM transactions
           ${where}
           ORDER BY ${sortColumn} ${sortDirection}, created_at DESC
+          ${pagination}
         `,
       )
       .all(params) as TransactionRow[]
@@ -319,7 +417,7 @@ export class DatabaseManager {
 
     const row = this.db
       .prepare(`
-        SELECT id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at
+        SELECT id, amount, type, category, income_source, payee, date, note, review_status, origin, recurring_transaction_id, created_at
         FROM transactions
         WHERE id = ?
       `)
@@ -339,43 +437,45 @@ export class DatabaseManager {
     batch(ids)
   }
 
+  bulkUpdateTransactionCategory(ids: string[], category: string) {
+    if (!ids.length) return
+    const update = this.db.prepare("UPDATE transactions SET category = ?, income_source = NULL, type = 'expense' WHERE id = ?")
+    const batch = this.db.transaction((items: string[]) => {
+      for (const id of items) update.run(category, id)
+    })
+    batch(ids)
+  }
+
   getBudgets(month: string): BudgetsPayload {
     this.applyBudgetTemplates(month)
-
-    const budgets = this.getBudgetRows(month)
-    const spends = this.getExpensesByCategory(month)
-    const progress = budgets.map((budget) => toBudgetProgress(budget, spends.get(budget.category) ?? 0))
-    const totalBudget = progress.reduce((sum, item) => sum + item.amount, 0)
-    const totalSpent = progress.reduce((sum, item) => sum + item.spent, 0)
-
-    return {
-      month,
-      budgets: progress.sort((left, right) => right.percentage - left.percentage),
-      overview: {
-        totalBudget,
-        totalSpent,
-        percentage: totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0,
-      },
-    }
+    return this.getBudgetsWithoutApplying(month)
   }
 
   setBudget(input: BudgetInput): BudgetProgress {
     const existing = this.db
-      .prepare('SELECT id, category, amount, month FROM budgets WHERE category = ? AND month = ?')
+      .prepare('SELECT id, category, amount, month, rollover_enabled FROM budgets WHERE category = ? AND month = ?')
       .get(input.category, input.month) as BudgetRow | undefined
 
     if (existing) {
-      this.db.prepare('UPDATE budgets SET amount = ? WHERE id = ?').run(input.amount, existing.id)
+      this.db.prepare('UPDATE budgets SET amount = ?, rollover_enabled = ? WHERE id = ?').run(
+        input.amount,
+        input.rolloverEnabled ? 1 : 0,
+        existing.id,
+      )
     } else {
       this.db
-        .prepare('INSERT INTO budgets(id, category, amount, month) VALUES (?, ?, ?, ?)')
-        .run(randomUUID(), input.category, input.amount, input.month)
+        .prepare('INSERT INTO budgets(id, category, amount, month, rollover_enabled) VALUES (?, ?, ?, ?, ?)')
+        .run(randomUUID(), input.category, input.amount, input.month, input.rolloverEnabled ? 1 : 0)
     }
 
     const refreshed = this.getBudgetRows(input.month).find((budget) => budget.category === input.category)
     if (!refreshed) throw new Error('Budget could not be saved.')
 
-    return toBudgetProgress(refreshed, this.getExpensesByCategory(input.month).get(input.category) ?? 0)
+    return toBudgetProgress(
+      refreshed,
+      this.getExpensesByCategory(input.month).get(input.category) ?? 0,
+      refreshed.rollover_enabled ? this.getBudgetCarryoverAmount(input.category, input.month) : 0,
+    )
   }
 
   deleteBudget(id: string, month: string): BudgetsPayload {
@@ -397,6 +497,7 @@ export class DatabaseManager {
           SET category = @category,
               amount = @amount,
               active = @active,
+              rollover_enabled = @rolloverEnabled,
               updated_at = @updatedAt
           WHERE id = @id
         `)
@@ -405,6 +506,7 @@ export class DatabaseManager {
           category: input.category,
           amount: input.amount,
           active: input.active ? 1 : 0,
+          rolloverEnabled: input.rolloverEnabled ? 1 : 0,
           updatedAt: now,
         })
     } else {
@@ -418,6 +520,7 @@ export class DatabaseManager {
             UPDATE budget_templates
             SET amount = @amount,
                 active = @active,
+                rollover_enabled = @rolloverEnabled,
                 updated_at = @updatedAt
             WHERE id = @id
           `)
@@ -425,19 +528,21 @@ export class DatabaseManager {
             id: existing.id,
             amount: input.amount,
             active: input.active ? 1 : 0,
+            rolloverEnabled: input.rolloverEnabled ? 1 : 0,
             updatedAt: now,
           })
       } else {
         this.db
           .prepare(`
-            INSERT INTO budget_templates(id, category, amount, active, created_at, updated_at)
-            VALUES (@id, @category, @amount, @active, @createdAt, @updatedAt)
+            INSERT INTO budget_templates(id, category, amount, active, rollover_enabled, created_at, updated_at)
+            VALUES (@id, @category, @amount, @active, @rolloverEnabled, @createdAt, @updatedAt)
           `)
           .run({
             id: randomUUID(),
             category: input.category,
             amount: input.amount,
             active: input.active ? 1 : 0,
+            rolloverEnabled: input.rolloverEnabled ? 1 : 0,
             createdAt: now,
             updatedAt: now,
           })
@@ -445,7 +550,7 @@ export class DatabaseManager {
     }
 
     const row = this.db
-      .prepare('SELECT id, category, amount, active, created_at, updated_at FROM budget_templates WHERE category = ?')
+      .prepare('SELECT id, category, amount, active, rollover_enabled, created_at, updated_at FROM budget_templates WHERE category = ?')
       .get(input.category) as BudgetTemplateRow | undefined
 
     if (!row) {
@@ -461,7 +566,7 @@ export class DatabaseManager {
 
   applyBudgetTemplates(month: string): BudgetsPayload {
     const templates = this.db
-      .prepare('SELECT id, category, amount, active, created_at, updated_at FROM budget_templates WHERE active = 1 ORDER BY category ASC')
+      .prepare('SELECT id, category, amount, active, rollover_enabled, created_at, updated_at FROM budget_templates WHERE active = 1 ORDER BY category ASC')
       .all() as BudgetTemplateRow[]
 
     this.db.transaction(() => {
@@ -472,13 +577,36 @@ export class DatabaseManager {
 
         if (!existing) {
           this.db
-            .prepare('INSERT INTO budgets(id, category, amount, month) VALUES (?, ?, ?, ?)')
-            .run(randomUUID(), template.category, template.amount, month)
+            .prepare('INSERT INTO budgets(id, category, amount, month, rollover_enabled) VALUES (?, ?, ?, ?, ?)')
+            .run(randomUUID(), template.category, template.amount, month, template.rollover_enabled)
         }
       }
     })()
 
     return this.getBudgetsWithoutApplying(month)
+  }
+
+  copyBudgetsFromPreviousMonth(month: string): BudgetsPayload {
+    const [year, monthNum] = month.split('-').map(Number)
+    const prevDate = new Date(Date.UTC(year, monthNum - 2, 1)) // JS Date handles Jan → Dec rollback
+    const prevMonth = `${prevDate.getUTCFullYear()}-${String(prevDate.getUTCMonth() + 1).padStart(2, '0')}`
+    const sourceBudgets = this.getBudgetRows(prevMonth)
+
+    this.db.transaction(() => {
+      for (const budget of sourceBudgets) {
+        const existing = this.db
+          .prepare('SELECT id FROM budgets WHERE category = ? AND month = ?')
+          .get(budget.category, month) as { id: string } | undefined
+
+        if (!existing) {
+          this.db
+            .prepare('INSERT INTO budgets(id, category, amount, month, rollover_enabled) VALUES (?, ?, ?, ?, ?)')
+            .run(randomUUID(), budget.category, budget.amount, month, budget.rollover_enabled)
+        }
+      }
+    })()
+
+    return this.getBudgets(month)
   }
 
   saveMonthAsBudgetTemplates(month: string): BudgetTemplate[] {
@@ -488,8 +616,8 @@ export class DatabaseManager {
     this.db.transaction(() => {
       this.db.prepare('DELETE FROM budget_templates').run()
       const insert = this.db.prepare(`
-        INSERT INTO budget_templates(id, category, amount, active, created_at, updated_at)
-        VALUES (@id, @category, @amount, 1, @createdAt, @updatedAt)
+        INSERT INTO budget_templates(id, category, amount, active, rollover_enabled, created_at, updated_at)
+        VALUES (@id, @category, @amount, 1, @rolloverEnabled, @createdAt, @updatedAt)
       `)
 
       for (const budget of budgets) {
@@ -497,6 +625,7 @@ export class DatabaseManager {
           id: randomUUID(),
           category: budget.category,
           amount: budget.amount,
+          rolloverEnabled: budget.rollover_enabled,
           createdAt: now,
           updatedAt: now,
         })
@@ -524,6 +653,10 @@ export class DatabaseManager {
       dayOfMonth: normalized.dayOfMonth,
       startMonth: normalized.startMonth,
       active: normalized.active ? 1 : 0,
+      postingMode: normalized.postingMode,
+      expectedAmount: normalized.expectedAmount,
+      reminderDays: normalized.reminderDays,
+      subscriptionLabel: normalized.subscriptionLabel?.trim() || null,
       updatedAt: now,
     }
 
@@ -540,6 +673,10 @@ export class DatabaseManager {
               day_of_month = @dayOfMonth,
               start_month = @startMonth,
               active = @active,
+              posting_mode = @postingMode,
+              expected_amount = @expectedAmount,
+              reminder_days = @reminderDays,
+              subscription_label = @subscriptionLabel,
               updated_at = @updatedAt
           WHERE id = @id
         `)
@@ -548,16 +685,16 @@ export class DatabaseManager {
       this.db
         .prepare(`
           INSERT INTO recurring_transactions(
-            id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+            id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, posting_mode, expected_amount, reminder_days, subscription_label, created_at, updated_at
           )
-          VALUES (@id, @payee, @amount, @type, @category, @incomeSource, @note, @dayOfMonth, @startMonth, NULL, @active, @updatedAt, @updatedAt)
+          VALUES (@id, @payee, @amount, @type, @category, @incomeSource, @note, @dayOfMonth, @startMonth, NULL, @active, @postingMode, @expectedAmount, @reminderDays, @subscriptionLabel, @updatedAt, @updatedAt)
         `)
         .run(payload)
     }
 
     const row = this.db
       .prepare(`
-        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, posting_mode, expected_amount, reminder_days, subscription_label, created_at, updated_at
         FROM recurring_transactions
         WHERE id = ?
       `)
@@ -579,7 +716,7 @@ export class DatabaseManager {
     const day = referenceDate.getUTCDate()
     const recurringTransactions = this.db
       .prepare(`
-        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, posting_mode, expected_amount, reminder_days, subscription_label, created_at, updated_at
         FROM recurring_transactions
         WHERE active = 1
         ORDER BY created_at ASC
@@ -591,6 +728,10 @@ export class DatabaseManager {
     this.db.transaction(() => {
       for (const recurring of recurringTransactions) {
         if (month < recurring.start_month || recurring.last_posted_month === month || day < recurring.day_of_month) {
+          continue
+        }
+
+        if (recurring.posting_mode === 'reminder') {
           continue
         }
 
@@ -609,6 +750,8 @@ export class DatabaseManager {
               payee: recurring.payee,
               date: transactionDate,
               note: recurring.note ?? '',
+              origin: 'recurring',
+              reviewStatus: 'reviewed',
             },
             recurring.id,
           )
@@ -622,6 +765,26 @@ export class DatabaseManager {
     })()
 
     return { month, createdCount }
+  }
+
+  getUpcomingBills(referenceDate = new Date()): UpcomingBill[] {
+    return this.getRecurringDueCandidates(referenceDate)
+      .map(({ row, dueDate, isGap }) => ({
+        recurringTransactionId: row.id,
+        payee: row.payee,
+        dueDate,
+        amount: row.amount,
+        expectedAmount: row.expected_amount ?? row.amount,
+        type: row.type,
+        category: row.category,
+        incomeSource: row.income_source,
+        postingMode: row.posting_mode,
+        reminderDays: row.reminder_days,
+        subscriptionLabel: row.subscription_label,
+        isSubscription: Boolean(row.subscription_label),
+        isGap,
+      }))
+      .sort((left, right) => left.dueDate.localeCompare(right.dueDate) || left.payee.localeCompare(right.payee))
   }
 
   getPayeeRules(search = ''): PayeeRule[] {
@@ -708,13 +871,104 @@ export class DatabaseManager {
     return row ? mapPayeeRuleRow(row) : null
   }
 
+  findCsvImportMapping(headersKey: string): SavedCsvMapping | null {
+    const row = this.db
+      .prepare('SELECT id, headers_key, mapping, amount_mode, default_expense_type, created_at, updated_at FROM csv_import_mappings WHERE headers_key = ?')
+      .get(headersKey) as { id: string; headers_key: string; mapping: string; amount_mode: string; default_expense_type: string; created_at: string; updated_at: string } | undefined
+
+    if (!row) return null
+
+    return {
+      id: row.id,
+      headersKey: row.headers_key,
+      mapping: JSON.parse(row.mapping) as CsvImportMapping,
+      amountMode: row.amount_mode as CsvImportAmountMode,
+      defaultExpenseType: row.default_expense_type as 'income' | 'expense',
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }
+  }
+
+  saveCsvImportMapping(saved: SavedCsvMapping): void {
+    const now = new Date().toISOString()
+    this.db
+      .prepare(`
+        INSERT INTO csv_import_mappings(id, headers_key, mapping, amount_mode, default_expense_type, created_at, updated_at)
+        VALUES (@id, @headersKey, @mapping, @amountMode, @defaultExpenseType, @createdAt, @updatedAt)
+        ON CONFLICT(headers_key) DO UPDATE SET
+          mapping = excluded.mapping,
+          amount_mode = excluded.amount_mode,
+          default_expense_type = excluded.default_expense_type,
+          updated_at = excluded.updated_at
+      `)
+      .run({
+        id: saved.id,
+        headersKey: saved.headersKey,
+        mapping: JSON.stringify(saved.mapping),
+        amountMode: saved.amountMode,
+        defaultExpenseType: saved.defaultExpenseType,
+        createdAt: saved.createdAt ?? now,
+        updatedAt: now,
+      })
+  }
+
+  getCategories(): CategoryListResult {
+    type CustomCategoryRow = { id: string; name: string; color: string; sort_order: number; created_at: string }
+    const rows = this.db
+      .prepare('SELECT id, name, color, sort_order, created_at FROM custom_categories ORDER BY sort_order ASC, created_at ASC')
+      .all() as CustomCategoryRow[]
+
+    const custom: CustomCategory[] = rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      color: row.color,
+      sortOrder: row.sort_order,
+      createdAt: row.created_at,
+    }))
+
+    const all = [...BUDGET_CATEGORIES, ...custom.map((c) => c.name)]
+    const colors: Record<string, string> = { ...CATEGORY_COLORS }
+    for (const c of custom) colors[c.name] = c.color
+
+    return { builtin: BUDGET_CATEGORIES, custom, all, colors }
+  }
+
+  addCustomCategory(input: CustomCategoryInput): CustomCategory {
+    const name = input.name.trim()
+    if (!name) throw new Error('Category name cannot be empty.')
+
+    const nameLower = name.toLowerCase()
+    if (BUDGET_CATEGORIES.some((b) => b.toLowerCase() === nameLower)) {
+      throw new Error(`"${name}" is already a built-in category.`)
+    }
+
+    const existing = this.db.prepare('SELECT id FROM custom_categories WHERE LOWER(name) = LOWER(?)').get(name)
+    if (existing) throw new Error(`Category "${name}" already exists.`)
+
+    const countRow = this.db.prepare('SELECT COUNT(*) as count FROM custom_categories').get() as { count: number }
+    const color = input.color ?? CUSTOM_CATEGORY_PALETTE[countRow.count % CUSTOM_CATEGORY_PALETTE.length]
+    const id = randomUUID()
+    const now = new Date().toISOString()
+
+    this.db
+      .prepare('INSERT INTO custom_categories(id, name, color, sort_order, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(id, name, color, countRow.count, now)
+
+    return { id, name, color, sortOrder: countRow.count, createdAt: now }
+  }
+
+  deleteCustomCategory(id: string): void {
+    this.db.prepare('DELETE FROM custom_categories WHERE id = ?').run(id)
+  }
+
   previewTransactionCsvImport(request: CsvImportPreviewRequest): CsvImportPreviewResult {
     const { fileName, headers, rows } = readCsvPreviewFile(request.filePath)
     const signatures = new Set(this.queryTransactions().map((transaction) => buildTransactionSignature(transaction)))
+    const allCategories = this.getCategories().all
 
     const previewRows = rows.map((values, index) => {
       const source = buildCsvSource(headers, values)
-      const parsed = this.parseCsvRow(source, request)
+      const parsed = this.parseCsvRow(source, request, allCategories)
 
       if (!parsed.transaction) {
         return {
@@ -756,6 +1010,7 @@ export class DatabaseManager {
     let insertedCount = 0
     let skippedDuplicateCount = 0
     let invalidCount = 0
+    let pendingReviewCount = 0
     const learnedRules = new Set<string>()
 
     this.db.transaction(() => {
@@ -770,8 +1025,16 @@ export class DatabaseManager {
           continue
         }
 
-        this.insertTransaction(row.transaction)
+        const needsReview = row.status === 'defaulted' || row.status === 'rule-filled'
+        this.insertTransaction({
+          ...row.transaction,
+          origin: 'csv',
+          reviewStatus: needsReview ? 'pending' : 'reviewed',
+        })
         insertedCount += 1
+        if (needsReview) {
+          pendingReviewCount += 1
+        }
 
         if (request.learnRules && row.transaction.type === 'expense' && row.transaction.payee?.trim() && row.transaction.category) {
           this.upsertPayeeRule({
@@ -788,32 +1051,82 @@ export class DatabaseManager {
       skippedDuplicateCount,
       invalidCount,
       learnedRuleCount: learnedRules.size,
+      pendingReviewCount,
     }
   }
 
   getDashboardData(period: Period): DashboardData {
     const currentPeriod = getCurrentPeriod(period)
     const transactions = this.getTransactionsInRange(currentPeriod.start, currentPeriod.end)
-    const budgetTotal = this.getBudgetRows(currentPeriod.monthKey).reduce((sum, item) => sum + item.amount, 0)
+    const budgetPayload = this.getBudgets(currentPeriod.monthKey)
+    const forecast = this.getCashFlowForecast()
+    const summary = buildSummary(transactions, budgetPayload.overview.totalAvailable)
+
+    let projectedMonthlySpend: number | null = null
+    if (period === 'month') {
+      const now = new Date()
+      const daysElapsed = now.getUTCDate()
+      const daysInMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 0)).getUTCDate()
+      if (daysElapsed >= 3 && summary.totalSpent > 0) {
+        projectedMonthlySpend = (summary.totalSpent / daysElapsed) * daysInMonth
+      }
+    }
 
     return {
       period,
-      summary: buildSummary(transactions, budgetTotal),
-      spendingByCategory: aggregateCategorySpend(transactions),
+      summary,
+      spendingByCategory: aggregateCategorySpend(transactions, this.getCategories().colors),
       spendingTrend: this.buildTrend(period, 6),
       recentTransactions: this.queryTransactions().slice(0, 10),
+      projectedMonthlySpend,
+      upcomingBills: this.getUpcomingBills(),
+      safeToSpend: forecast.safeToSpend,
+      projectedEndOfMonthBalance: forecast.projectedEndOfMonthBalance,
     }
   }
 
-  getAnalyticsData(period: Period): AnalyticsData {
+  getCashFlowForecast(referenceDate = new Date()): CashFlowForecast {
+    const month = monthKey(referenceDate)
+    const periodStart = new Date(Date.UTC(referenceDate.getUTCFullYear(), referenceDate.getUTCMonth(), 1))
+    const periodEnd = new Date(Date.UTC(referenceDate.getUTCFullYear(), referenceDate.getUTCMonth() + 1, 0, 23, 59, 59, 999))
+    const transactions = this.getTransactionsInRange(periodStart, periodEnd)
+    const realizedIncome = transactions
+      .filter((transaction) => transaction.type === 'income')
+      .reduce((sum, transaction) => sum + transaction.amount, 0)
+    const realizedSpent = transactions
+      .filter((transaction) => transaction.type === 'expense')
+      .reduce((sum, transaction) => sum + transaction.amount, 0)
+    const upcoming = this.getUpcomingBills(referenceDate).filter((bill) => bill.dueDate.slice(0, 7) === month)
+    const upcomingExpenseTotal = upcoming
+      .filter((bill) => bill.type === 'expense')
+      .reduce((sum, bill) => sum + bill.expectedAmount, 0)
+    const upcomingIncomeTotal = upcoming
+      .filter((bill) => bill.type === 'income')
+      .reduce((sum, bill) => sum + bill.expectedAmount, 0)
+    const projectedEndOfMonthBalance = realizedIncome + upcomingIncomeTotal - realizedSpent - upcomingExpenseTotal
+    const monthBudgets = this.getBudgets(month)
+    const remainingBudget = monthBudgets.overview.totalAvailable - monthBudgets.overview.totalSpent
+
+    return {
+      asOfDate: toDateKey(referenceDate),
+      periodMonth: month,
+      upcomingExpenseTotal,
+      upcomingIncomeTotal,
+      projectedEndOfMonthBalance,
+      safeToSpend: Math.min(projectedEndOfMonthBalance, remainingBudget || projectedEndOfMonthBalance),
+    }
+  }
+
+  getAnalyticsData(period: Period, monthOverMonthCount = 4): AnalyticsData {
     const currentPeriod = getCurrentPeriod(period)
     const transactions = this.getTransactionsInRange(currentPeriod.start, currentPeriod.end)
+    const colorMap = this.getCategories().colors
 
     return {
       period,
-      categoryBreakdown: aggregateCategorySpend(transactions),
+      categoryBreakdown: aggregateCategorySpend(transactions, colorMap),
       spendingTrend: this.buildTrend(period, 6),
-      categoryTrends: this.buildCategoryTrends(period, 6),
+      categoryTrends: this.buildCategoryTrends(period, 6, colorMap),
       topExpenses: transactions
         .filter((transaction) => transaction.type === 'expense')
         .sort((left, right) => right.amount - left.amount)
@@ -826,7 +1139,7 @@ export class DatabaseManager {
           date: transaction.date,
           amount: transaction.amount,
         })),
-      monthOverMonth: this.buildTrend('month', 4),
+      monthOverMonth: this.buildTrend('month', monthOverMonthCount),
     }
   }
 
@@ -834,15 +1147,42 @@ export class DatabaseManager {
     const [year, month] = periodMonth.split('-').map(Number)
     const start = new Date(Date.UTC(year, month - 1, 1))
     const end = new Date(Date.UTC(year, month, 0, 23, 59, 59, 999))
+    const previousMonth = shiftMonthKey(periodMonth, -1)
+    const [previousYear, previousMonthIndex] = previousMonth.split('-').map(Number)
+    const previousStart = new Date(Date.UTC(previousYear, previousMonthIndex - 1, 1))
+    const previousEnd = new Date(Date.UTC(previousYear, previousMonthIndex, 0, 23, 59, 59, 999))
     const transactions = this.getTransactionsInRange(start, end)
-    const spendingByCategory = aggregateCategorySpend(transactions)
+    const previousTransactions = this.getTransactionsInRange(previousStart, previousEnd)
+    const spendingByCategory = aggregateCategorySpend(transactions, this.getCategories().colors)
+    const previousSpendingByCategory = aggregateCategorySpend(previousTransactions, this.getCategories().colors)
     const totalIncome = transactions
       .filter((transaction) => transaction.type === 'income')
       .reduce((sum, transaction) => sum + transaction.amount, 0)
+    const totalSpent = transactions
+      .filter((transaction) => transaction.type === 'expense')
+      .reduce((sum, transaction) => sum + transaction.amount, 0)
+    const previousCategoryMap = new Map(previousSpendingByCategory.map((entry) => [entry.category, entry.amount]))
+    const currentCategoryMap = new Map(spendingByCategory.map((entry) => [entry.category, entry.amount]))
+    const monthOverMonthChanges = Array.from(new Set([...currentCategoryMap.keys(), ...previousCategoryMap.keys()])).map((category) => {
+      const currentAmount = currentCategoryMap.get(category) ?? 0
+      const previousAmount = previousCategoryMap.get(category) ?? 0
+
+      return {
+        category,
+        currentAmount,
+        previousAmount,
+        delta: currentAmount - previousAmount,
+      }
+    })
 
     return {
       spendingByCategory,
       totalIncome,
+      totalSpent,
+      monthOverMonthChanges,
+      pendingReviewCount: this.getPendingReviewTransactions().length,
+      upcomingBills: this.getUpcomingBills(new Date(`${periodMonth}-01T12:00:00.000Z`)).filter((bill) => bill.dueDate.startsWith(periodMonth)),
+      budgetOverview: this.getBudgets(periodMonth).overview,
     }
   }
 
@@ -909,24 +1249,24 @@ export class DatabaseManager {
       this.db.prepare('DELETE FROM settings').run()
 
       const transactionInsert = this.db.prepare(`
-        INSERT INTO transactions(id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at)
-        VALUES (@id, @amount, @type, @category, @incomeSource, @payee, @date, @note, @recurringTransactionId, @createdAt)
+        INSERT INTO transactions(id, amount, type, category, income_source, payee, date, note, review_status, origin, recurring_transaction_id, created_at)
+        VALUES (@id, @amount, @type, @category, @incomeSource, @payee, @date, @note, @reviewStatus, @origin, @recurringTransactionId, @createdAt)
       `)
       const budgetInsert = this.db.prepare(`
-        INSERT INTO budgets(id, category, amount, month)
-        VALUES (@id, @category, @amount, @month)
+        INSERT INTO budgets(id, category, amount, month, rollover_enabled)
+        VALUES (@id, @category, @amount, @month, @rolloverEnabled)
       `)
       const cacheInsert = this.db.prepare(`
         INSERT INTO ai_cache(key, payload, created_at)
         VALUES (@key, @payload, @createdAt)
       `)
       const recurringInsert = this.db.prepare(`
-        INSERT INTO recurring_transactions(id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at)
-        VALUES (@id, @payee, @amount, @type, @category, @incomeSource, @note, @dayOfMonth, @startMonth, @lastPostedMonth, @active, @createdAt, @updatedAt)
+        INSERT INTO recurring_transactions(id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, posting_mode, expected_amount, reminder_days, subscription_label, created_at, updated_at)
+        VALUES (@id, @payee, @amount, @type, @category, @incomeSource, @note, @dayOfMonth, @startMonth, @lastPostedMonth, @active, @postingMode, @expectedAmount, @reminderDays, @subscriptionLabel, @createdAt, @updatedAt)
       `)
       const budgetTemplateInsert = this.db.prepare(`
-        INSERT INTO budget_templates(id, category, amount, active, created_at, updated_at)
-        VALUES (@id, @category, @amount, @active, @createdAt, @updatedAt)
+        INSERT INTO budget_templates(id, category, amount, active, rollover_enabled, created_at, updated_at)
+        VALUES (@id, @category, @amount, @active, @rolloverEnabled, @createdAt, @updatedAt)
       `)
       const payeeRuleInsert = this.db.prepare(`
         INSERT INTO payee_rules(id, normalized_payee, payee_display, category, created_at, updated_at)
@@ -947,13 +1287,18 @@ export class DatabaseManager {
           payee: transaction.payee,
           date: transaction.date,
           note: transaction.note,
+          reviewStatus: transaction.reviewStatus ?? 'reviewed',
+          origin: transaction.origin ?? 'manual',
           recurringTransactionId: transaction.recurringTransactionId,
           createdAt: transaction.createdAt,
         })
       }
 
       for (const budget of snapshot.budgets) {
-        budgetInsert.run(budget)
+        budgetInsert.run({
+          ...budget,
+          rolloverEnabled: budget.rolloverEnabled ? 1 : 0,
+        })
       }
 
       for (const cacheRow of snapshot.aiCache) {
@@ -973,6 +1318,10 @@ export class DatabaseManager {
           startMonth: recurring.startMonth,
           lastPostedMonth: recurring.lastPostedMonth,
           active: recurring.active ? 1 : 0,
+          postingMode: recurring.postingMode ?? 'auto',
+          expectedAmount: recurring.expectedAmount ?? recurring.amount,
+          reminderDays: recurring.reminderDays ?? 3,
+          subscriptionLabel: recurring.subscriptionLabel ?? null,
           createdAt: recurring.createdAt,
           updatedAt: recurring.updatedAt,
         })
@@ -984,6 +1333,7 @@ export class DatabaseManager {
           category: template.category,
           amount: template.amount,
           active: template.active ? 1 : 0,
+          rolloverEnabled: template.rolloverEnabled ? 1 : 0,
           createdAt: template.createdAt,
           updatedAt: template.updatedAt,
         })
@@ -1044,11 +1394,66 @@ export class DatabaseManager {
     })
   }
 
+  private getRecurringDueCandidates(referenceDate: Date): RecurringDueCandidate[] {
+    const rows = this.db
+      .prepare(`
+        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, posting_mode, expected_amount, reminder_days, subscription_label, created_at, updated_at
+        FROM recurring_transactions
+        WHERE active = 1
+        ORDER BY day_of_month ASC, created_at ASC
+      `)
+      .all() as RecurringTransactionRow[]
+
+    return rows
+      .map((row) => {
+        const dueDate = getNextRecurringDueDate(row, referenceDate)
+        const isGap =
+          row.last_posted_month !== null &&
+          monthDistance(row.last_posted_month, monthKey(referenceDate)) > 1 &&
+          row.posting_mode === 'auto'
+
+        return {
+          row,
+          dueDate,
+          isGap,
+        }
+      })
+      .filter((candidate) => candidate.dueDate >= toDateKey(referenceDate))
+  }
+
+  private getBudgetCarryoverAmount(category: string, month: string, seen = new Set<string>()): number {
+    const guardKey = `${category}:${month}`
+    if (seen.has(guardKey)) {
+      return 0
+    }
+
+    seen.add(guardKey)
+    const previousMonth = shiftMonthKey(month, -1)
+    const previousBudget = this.db
+      .prepare('SELECT id, category, amount, month, rollover_enabled FROM budgets WHERE category = ? AND month = ?')
+      .get(category, previousMonth) as BudgetRow | undefined
+
+    if (!previousBudget || !previousBudget.rollover_enabled) {
+      return 0
+    }
+
+    const previousSpent = this.getExpensesByCategory(previousMonth).get(category) ?? 0
+    const upstreamCarryover = this.getBudgetCarryoverAmount(category, previousMonth, seen)
+    return previousBudget.amount + upstreamCarryover - previousSpent
+  }
+
   private getBudgetsWithoutApplying(month: string): BudgetsPayload {
     const budgets = this.getBudgetRows(month)
     const spends = this.getExpensesByCategory(month)
-    const progress = budgets.map((budget) => toBudgetProgress(budget, spends.get(budget.category) ?? 0))
+    const progress = budgets.map((budget) =>
+      toBudgetProgress(
+        budget,
+        spends.get(budget.category) ?? 0,
+        budget.rollover_enabled ? this.getBudgetCarryoverAmount(budget.category, month) : 0,
+      ),
+    )
     const totalBudget = progress.reduce((sum, item) => sum + item.amount, 0)
+    const totalAvailable = progress.reduce((sum, item) => sum + item.availableToSpend, 0)
     const totalSpent = progress.reduce((sum, item) => sum + item.spent, 0)
 
     return {
@@ -1056,8 +1461,9 @@ export class DatabaseManager {
       budgets: progress.sort((left, right) => right.percentage - left.percentage),
       overview: {
         totalBudget,
+        totalAvailable,
         totalSpent,
-        percentage: totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0,
+        percentage: totalAvailable > 0 ? (totalSpent / totalAvailable) * 100 : 0,
       },
     }
   }
@@ -1073,6 +1479,8 @@ export class DatabaseManager {
       payee: normalized.payee?.trim() || null,
       date: normalized.date,
       note: normalized.note?.trim() || null,
+      reviewStatus: normalized.reviewStatus ?? 'reviewed',
+      origin: normalized.origin ?? (recurringTransactionId ? 'recurring' : 'manual'),
       recurringTransactionId,
       createdAt: new Date().toISOString(),
     }
@@ -1080,8 +1488,8 @@ export class DatabaseManager {
     this.db
       .prepare(
         `
-        INSERT INTO transactions(id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at)
-        VALUES (@id, @amount, @type, @category, @incomeSource, @payee, @date, @note, @recurringTransactionId, @createdAt)
+        INSERT INTO transactions(id, amount, type, category, income_source, payee, date, note, review_status, origin, recurring_transaction_id, created_at)
+        VALUES (@id, @amount, @type, @category, @incomeSource, @payee, @date, @note, @reviewStatus, @origin, @recurringTransactionId, @createdAt)
       `,
       )
       .run(transaction)
@@ -1091,14 +1499,16 @@ export class DatabaseManager {
 
   private getBudgetRows(month: string) {
     return this.db
-      .prepare('SELECT id, category, amount, month FROM budgets WHERE month = ? ORDER BY category ASC')
+      .prepare('SELECT id, category, amount, month, rollover_enabled FROM budgets WHERE month = ? ORDER BY category ASC')
       .all(month) as BudgetRow[]
   }
 
   private getAllBudgetRows(): Budget[] {
-    return this.db
-      .prepare('SELECT id, category, amount, month FROM budgets ORDER BY month DESC, category ASC')
-      .all() as Budget[]
+    const rows = this.db
+      .prepare('SELECT id, category, amount, month, rollover_enabled FROM budgets ORDER BY month DESC, category ASC')
+      .all() as BudgetRow[]
+
+    return rows.map(mapBudgetRow)
   }
 
   private getAllCacheRows(): AICacheSnapshotEntry[] {
@@ -1116,7 +1526,7 @@ export class DatabaseManager {
   private getAllRecurringTransactionRows(): RecurringTransaction[] {
     const rows = this.db
       .prepare(`
-        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+        SELECT id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, posting_mode, expected_amount, reminder_days, subscription_label, created_at, updated_at
         FROM recurring_transactions
         ORDER BY created_at DESC
       `)
@@ -1128,7 +1538,7 @@ export class DatabaseManager {
   private getAllBudgetTemplateRows(): BudgetTemplate[] {
     const rows = this.db
       .prepare(`
-        SELECT id, category, amount, active, created_at, updated_at
+        SELECT id, category, amount, active, rollover_enabled, created_at, updated_at
         FROM budget_templates
         ORDER BY category ASC
       `)
@@ -1190,16 +1600,16 @@ export class DatabaseManager {
           .filter((transaction) => transaction.type === 'income')
           .reduce((sum, transaction) => sum + transaction.amount, 0),
         spent: transactions
-          .filter((transaction) => transaction.type === 'expense')
+          .filter((transaction) => transaction.type === 'expense' && !SAVINGS_CATEGORIES.has(transaction.category ?? ''))
           .reduce((sum, transaction) => sum + transaction.amount, 0),
       }
     })
   }
 
-  private buildCategoryTrends(period: Period, count: number): CategoryTrendDatum[] {
+  private buildCategoryTrends(period: Period, count: number, colorMap: Record<string, string> = CATEGORY_COLORS): CategoryTrendDatum[] {
     return buildBuckets(period, count).map((bucket) => {
       const data: CategoryTrendDatum = { label: bucket.label }
-      const breakdown = aggregateCategorySpend(this.getTransactionsInRange(bucket.start, bucket.end))
+      const breakdown = aggregateCategorySpend(this.getTransactionsInRange(bucket.start, bucket.end), colorMap)
 
       for (const item of breakdown) {
         data[item.category] = item.amount
@@ -1216,7 +1626,9 @@ export class DatabaseManager {
       categoryColumn?.notnull === 1 ||
       !this.hasColumn(columns, 'payee') ||
       !this.hasColumn(columns, 'recurring_transaction_id') ||
-      !this.hasColumn(columns, 'income_source')
+      !this.hasColumn(columns, 'income_source') ||
+      !this.hasColumn(columns, 'review_status') ||
+      !this.hasColumn(columns, 'origin')
 
     if (!requiresRebuild) {
       return
@@ -1233,13 +1645,15 @@ export class DatabaseManager {
           payee TEXT,
           date TEXT NOT NULL,
           note TEXT,
+          review_status TEXT NOT NULL DEFAULT 'reviewed',
+          origin TEXT NOT NULL DEFAULT 'manual',
           recurring_transaction_id TEXT,
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
       `)
 
       this.db.exec(`
-        INSERT INTO transactions_next(id, amount, type, category, income_source, payee, date, note, recurring_transaction_id, created_at)
+        INSERT INTO transactions_next(id, amount, type, category, income_source, payee, date, note, review_status, origin, recurring_transaction_id, created_at)
         SELECT
           id,
           amount,
@@ -1249,6 +1663,8 @@ export class DatabaseManager {
           ${this.hasColumn(columns, 'payee') ? 'payee' : 'NULL'},
           date,
           note,
+          ${this.hasColumn(columns, 'review_status') ? 'review_status' : "'reviewed'"},
+          ${this.hasColumn(columns, 'origin') ? 'origin' : "'manual'"},
           ${this.hasColumn(columns, 'recurring_transaction_id') ? 'recurring_transaction_id' : 'NULL'},
           created_at
         FROM transactions;
@@ -1264,7 +1680,13 @@ export class DatabaseManager {
   private migrateRecurringTransactionsTable() {
     const columns = this.getTableColumns('recurring_transactions')
     const categoryColumn = columns.find((column) => column.name === 'category')
-    const requiresRebuild = categoryColumn?.notnull === 1 || !this.hasColumn(columns, 'income_source')
+    const requiresRebuild =
+      categoryColumn?.notnull === 1 ||
+      !this.hasColumn(columns, 'income_source') ||
+      !this.hasColumn(columns, 'posting_mode') ||
+      !this.hasColumn(columns, 'expected_amount') ||
+      !this.hasColumn(columns, 'reminder_days') ||
+      !this.hasColumn(columns, 'subscription_label')
 
     if (!requiresRebuild) {
       return
@@ -1284,6 +1706,10 @@ export class DatabaseManager {
           start_month TEXT NOT NULL,
           last_posted_month TEXT,
           active INTEGER NOT NULL DEFAULT 1,
+          posting_mode TEXT NOT NULL DEFAULT 'auto',
+          expected_amount REAL,
+          reminder_days INTEGER NOT NULL DEFAULT 3,
+          subscription_label TEXT,
           created_at TEXT NOT NULL,
           updated_at TEXT NOT NULL
         );
@@ -1291,7 +1717,7 @@ export class DatabaseManager {
 
       this.db.exec(`
         INSERT INTO recurring_transactions_next(
-          id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, created_at, updated_at
+          id, payee, amount, type, category, income_source, note, day_of_month, start_month, last_posted_month, active, posting_mode, expected_amount, reminder_days, subscription_label, created_at, updated_at
         )
         SELECT
           id,
@@ -1305,6 +1731,10 @@ export class DatabaseManager {
           start_month,
           last_posted_month,
           active,
+          ${this.hasColumn(columns, 'posting_mode') ? 'posting_mode' : "'auto'"},
+          ${this.hasColumn(columns, 'expected_amount') ? 'expected_amount' : 'amount'},
+          ${this.hasColumn(columns, 'reminder_days') ? 'reminder_days' : '3'},
+          ${this.hasColumn(columns, 'subscription_label') ? 'subscription_label' : 'NULL'},
           created_at,
           updated_at
         FROM recurring_transactions;
@@ -1317,11 +1747,75 @@ export class DatabaseManager {
     })()
   }
 
+  private migrateBudgetsTable() {
+    const columns = this.getTableColumns('budgets')
+    if (this.hasColumn(columns, 'rollover_enabled')) {
+      return
+    }
+
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE budgets_next (
+          id TEXT PRIMARY KEY,
+          category TEXT NOT NULL,
+          amount REAL NOT NULL CHECK(amount > 0),
+          month TEXT NOT NULL,
+          rollover_enabled INTEGER NOT NULL DEFAULT 0,
+          UNIQUE(category, month)
+        );
+      `)
+
+      this.db.exec(`
+        INSERT INTO budgets_next(id, category, amount, month, rollover_enabled)
+        SELECT id, category, amount, month, 0
+        FROM budgets;
+      `)
+
+      this.db.exec(`
+        DROP TABLE budgets;
+        ALTER TABLE budgets_next RENAME TO budgets;
+      `)
+    })()
+  }
+
+  private migrateBudgetTemplatesTable() {
+    const columns = this.getTableColumns('budget_templates')
+    if (this.hasColumn(columns, 'rollover_enabled')) {
+      return
+    }
+
+    this.db.transaction(() => {
+      this.db.exec(`
+        CREATE TABLE budget_templates_next (
+          id TEXT PRIMARY KEY,
+          category TEXT NOT NULL UNIQUE,
+          amount REAL NOT NULL CHECK(amount > 0),
+          active INTEGER NOT NULL DEFAULT 1,
+          rollover_enabled INTEGER NOT NULL DEFAULT 0,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `)
+
+      this.db.exec(`
+        INSERT INTO budget_templates_next(id, category, amount, active, rollover_enabled, created_at, updated_at)
+        SELECT id, category, amount, active, 0, created_at, updated_at
+        FROM budget_templates;
+      `)
+
+      this.db.exec(`
+        DROP TABLE budget_templates;
+        ALTER TABLE budget_templates_next RENAME TO budget_templates;
+      `)
+    })()
+  }
+
   private createTransactionIndexes() {
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_transactions_date ON transactions(date DESC);
       CREATE INDEX IF NOT EXISTS idx_transactions_category ON transactions(category);
       CREATE INDEX IF NOT EXISTS idx_transactions_type ON transactions(type);
+      CREATE INDEX IF NOT EXISTS idx_transactions_review_status ON transactions(review_status);
       CREATE INDEX IF NOT EXISTS idx_transactions_recurring ON transactions(recurring_transaction_id) WHERE recurring_transaction_id IS NOT NULL;
     `)
   }
@@ -1337,6 +1831,7 @@ export class DatabaseManager {
   private parseCsvRow(
     source: Record<string, string>,
     request: CsvImportPreviewRequest,
+    allCategories: string[] = [...BUDGET_CATEGORIES],
   ): { status: CsvImportPreviewRow['status']; errors: string[]; transaction: TransactionInput | null } {
     const errors: string[] = []
     const date = parseImportDate(source[request.mapping.date])
@@ -1389,7 +1884,7 @@ export class DatabaseManager {
       }
     }
 
-    let category = BUDGET_CATEGORIES.includes(rawCategory as (typeof BUDGET_CATEGORIES)[number]) ? rawCategory : ''
+    let category = allCategories.includes(rawCategory) ? rawCategory : ''
 
     if (!category && payee) {
       const rule = this.findPayeeRule(payee)
@@ -1430,6 +1925,8 @@ function mapTransactionRow(row: TransactionRow): Transaction {
     payee: row.payee,
     date: row.date,
     note: row.note,
+    reviewStatus: row.review_status,
+    origin: row.origin,
     recurringTransactionId: row.recurring_transaction_id,
     createdAt: row.created_at,
   }
@@ -1448,8 +1945,23 @@ function mapRecurringTransactionRow(row: RecurringTransactionRow): RecurringTran
     startMonth: row.start_month,
     lastPostedMonth: row.last_posted_month,
     active: Boolean(row.active),
+    postingMode: row.posting_mode,
+    expectedAmount: row.expected_amount ?? row.amount,
+    nextDueDate: getNextRecurringDueDate(row, new Date()),
+    reminderDays: row.reminder_days,
+    subscriptionLabel: row.subscription_label,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  }
+}
+
+function mapBudgetRow(row: BudgetRow): Budget {
+  return {
+    id: row.id,
+    category: row.category,
+    amount: row.amount,
+    month: row.month,
+    rolloverEnabled: Boolean(row.rollover_enabled),
   }
 }
 
@@ -1459,6 +1971,7 @@ function mapBudgetTemplateRow(row: BudgetTemplateRow): BudgetTemplate {
     category: row.category,
     amount: row.amount,
     active: Boolean(row.active),
+    rolloverEnabled: Boolean(row.rollover_enabled),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -1557,7 +2070,9 @@ function parseImportIncomeSource(value: string | undefined): IncomeSource | null
   return match ?? null
 }
 
-function normalizeTransactionInput(input: TransactionInput): TransactionInput & { category: string | null; incomeSource: IncomeSource | null } {
+function normalizeTransactionInput(
+  input: TransactionInput,
+): TransactionInput & { category: string | null; incomeSource: IncomeSource | null } {
   if (input.type === 'income') {
     if (!input.incomeSource) {
       throw new Error('Income source is required for income transactions.')
@@ -1584,13 +2099,21 @@ function normalizeTransactionInput(input: TransactionInput): TransactionInput & 
 function normalizeRecurringTransactionInput(
   input: RecurringTransactionInput,
 ): RecurringTransactionInput & { category: string | null; incomeSource: IncomeSource | null } {
+  const normalizedBase = {
+    ...input,
+    postingMode: input.postingMode ?? 'auto',
+    expectedAmount: input.expectedAmount ?? input.amount,
+    reminderDays: input.reminderDays ?? 3,
+    subscriptionLabel: input.subscriptionLabel?.trim() || null,
+  }
+
   if (input.type === 'income') {
     if (!input.incomeSource) {
       throw new Error('Income source is required for recurring income transactions.')
     }
 
     return {
-      ...input,
+      ...normalizedBase,
       category: null,
       incomeSource: input.incomeSource,
     }
@@ -1601,7 +2124,7 @@ function normalizeRecurringTransactionInput(
   }
 
   return {
-    ...input,
+    ...normalizedBase,
     category: input.category,
     incomeSource: null,
   }
@@ -1629,12 +2152,29 @@ function getRecurringDateForMonth(month: string, dayOfMonth: number) {
   return `${month}-${String(Math.min(dayOfMonth, lastDay)).padStart(2, '0')}`
 }
 
+function getNextRecurringDueDate(recurring: RecurringTransactionRow, referenceDate: Date) {
+  const currentMonth = monthKey(referenceDate)
+  const currentMonthDue = getRecurringDateForMonth(currentMonth, recurring.day_of_month)
+  if (currentMonth < recurring.start_month) {
+    return getRecurringDateForMonth(recurring.start_month, recurring.day_of_month)
+  }
+
+  if (currentMonthDue >= toDateKey(referenceDate) && recurring.last_posted_month !== currentMonth) {
+    return currentMonthDue
+  }
+
+  return getRecurringDateForMonth(shiftMonthKey(currentMonth, 1), recurring.day_of_month)
+}
+
 function buildSummary(transactions: Transaction[], budgetTotal: number): SummaryCardData {
   const totalIncome = transactions
     .filter((transaction) => transaction.type === 'income')
     .reduce((sum, transaction) => sum + transaction.amount, 0)
+  const transferredToSavings = transactions
+    .filter((transaction) => transaction.type === 'expense' && SAVINGS_CATEGORIES.has(transaction.category ?? ''))
+    .reduce((sum, transaction) => sum + transaction.amount, 0)
   const totalSpent = transactions
-    .filter((transaction) => transaction.type === 'expense')
+    .filter((transaction) => transaction.type === 'expense' && !SAVINGS_CATEGORIES.has(transaction.category ?? ''))
     .reduce((sum, transaction) => sum + transaction.amount, 0)
   const remainingBudget = budgetTotal > 0 ? budgetTotal - totalSpent : totalIncome - totalSpent
   const savingsRate = totalIncome > 0 ? ((totalIncome - totalSpent) / totalIncome) * 100 : 0
@@ -1644,6 +2184,7 @@ function buildSummary(transactions: Transaction[], budgetTotal: number): Summary
     totalSpent,
     remainingBudget,
     savingsRate,
+    transferredToSavings,
   }
 }
 
@@ -1690,10 +2231,12 @@ function getCurrentPeriod(period: Period) {
 
   if (period === 'week') {
     const start = getWeekStart(now)
+    const weekEnd = new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate() + 6, 23, 59, 59, 999))
     return {
       start,
-      end: new Date(Date.UTC(start.getUTCFullYear(), start.getUTCMonth(), start.getUTCDate() + 6, 23, 59, 59, 999)),
-      monthKey: monthKey(now),
+      end: weekEnd,
+      // Use the month the week ends in so budget display aligns with the majority of the week
+      monthKey: monthKey(weekEnd),
     }
   }
 
@@ -1712,11 +2255,12 @@ function getCurrentPeriod(period: Period) {
   }
 }
 
-function aggregateCategorySpend(transactions: Transaction[]): CategorySpendDatum[] {
+function aggregateCategorySpend(transactions: Transaction[], colorMap: Record<string, string> = CATEGORY_COLORS): CategorySpendDatum[] {
   const totals = new Map<string, number>()
 
   for (const transaction of transactions) {
     if (transaction.type !== 'expense' || !transaction.category) continue
+    if (SAVINGS_CATEGORIES.has(transaction.category)) continue
     totals.set(transaction.category, (totals.get(transaction.category) ?? 0) + transaction.amount)
   }
 
@@ -1724,22 +2268,25 @@ function aggregateCategorySpend(transactions: Transaction[]): CategorySpendDatum
     .map(([category, amount]) => ({
       category,
       amount,
-      color: CATEGORY_COLORS[category] ?? CATEGORY_COLORS.Other,
+      color: colorMap[category] ?? colorMap.Other ?? CATEGORY_COLORS.Other,
     }))
     .sort((left, right) => right.amount - left.amount)
 }
 
-function toBudgetProgress(budget: BudgetRow, spent: number): BudgetProgress {
-  const percentage = budget.amount > 0 ? (spent / budget.amount) * 100 : 0
+function toBudgetProgress(budget: BudgetRow, spent: number, carryoverAmount: number): BudgetProgress {
+  const availableToSpend = budget.amount + carryoverAmount
+  const percentage = availableToSpend > 0 ? (spent / availableToSpend) * 100 : 0
 
   let status: BudgetProgress['status'] = 'healthy'
   if (percentage >= 100) status = 'danger'
   else if (percentage >= 80) status = 'warning'
 
   return {
-    ...budget,
+    ...mapBudgetRow(budget),
     spent,
-    remaining: budget.amount - spent,
+    carryoverAmount,
+    availableToSpend,
+    remaining: availableToSpend - spent,
     percentage,
     status,
   }
@@ -1757,6 +2304,18 @@ function shiftDays(reference: Date, days: number) {
 
 function monthKey(date: Date) {
   return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
+}
+
+function shiftMonthKey(month: string, amount: number) {
+  const [year, monthIndex] = month.split('-').map(Number)
+  const shifted = new Date(Date.UTC(year, monthIndex - 1 + amount, 1))
+  return monthKey(shifted)
+}
+
+function monthDistance(fromMonth: string, toMonth: string) {
+  const [fromYear, fromIndex] = fromMonth.split('-').map(Number)
+  const [toYear, toIndex] = toMonth.split('-').map(Number)
+  return (toYear - fromYear) * 12 + (toIndex - fromIndex)
 }
 
 function toDateKey(date: Date) {

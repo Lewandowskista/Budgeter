@@ -39,4 +39,30 @@ describe('RecurringTransactionDialog', () => {
       )
     })
   })
+
+  it('supports reminder mode, expected amount, reminder lead time, and subscription labels', async () => {
+    const onSubmit = vi.fn().mockResolvedValue(undefined)
+
+    render(<RecurringTransactionDialog open onOpenChange={vi.fn()} onSubmit={onSubmit} />)
+
+    fireEvent.change(screen.getByLabelText('Payee'), { target: { value: 'Netflix' } })
+    fireEvent.change(screen.getByLabelText('Amount'), { target: { value: '15.99' } })
+    fireEvent.change(screen.getByRole('combobox', { name: /posting mode/i }), { target: { value: 'reminder' } })
+    fireEvent.change(screen.getByLabelText(/expected amount/i), { target: { value: '19.99' } })
+    fireEvent.change(screen.getByLabelText(/remind me/i), { target: { value: '7' } })
+    fireEvent.change(screen.getByLabelText(/subscription label/i), { target: { value: 'Streaming' } })
+
+    fireEvent.submit(screen.getByRole('button', { name: /create recurring transaction/i }).closest('form')!)
+
+    await waitFor(() => {
+      expect(onSubmit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          postingMode: 'reminder',
+          expectedAmount: 19.99,
+          reminderDays: 7,
+          subscriptionLabel: 'Streaming',
+        }),
+      )
+    })
+  })
 })

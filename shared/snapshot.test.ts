@@ -10,6 +10,11 @@ describe('sanitizeSettingsForSnapshot', () => {
         country: 'Romania',
         geminiApiKey: 'secret-key',
         theme: 'dark',
+        onboardingCompleted: 'true',
+        notifyUpcomingBills: 'true',
+        notifyBudgetAlerts: 'true',
+        notifyIncomeAlerts: 'false',
+        notifyRecurringGaps: 'true',
       }),
     ).toEqual({
       currency: 'USD',
@@ -17,6 +22,11 @@ describe('sanitizeSettingsForSnapshot', () => {
       country: 'Romania',
       geminiApiKey: '',
       theme: 'dark',
+      onboardingCompleted: 'true',
+      notifyUpcomingBills: 'true',
+      notifyBudgetAlerts: 'true',
+      notifyIncomeAlerts: 'false',
+      notifyRecurringGaps: 'true',
     })
   })
 })

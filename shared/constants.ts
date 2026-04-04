@@ -10,6 +10,12 @@ export const DEFAULT_SETTINGS: AppSettings = {
   country: '',
   geminiApiKey: '',
   theme: DEFAULT_THEME,
+  onboardingCompleted: '',
+  notifyUpcomingBills: 'true',
+  notifyBudgetAlerts: 'true',
+  notifyIncomeAlerts: 'false',
+  notifyRecurringGaps: 'true',
+  savingsGoal: '20',
 }
 
 export const BUDGET_CATEGORIES = [
@@ -53,4 +59,23 @@ export const SETTINGS_KEYS = [
   'country',
   'geminiApiKey',
   'theme',
+  'onboardingCompleted',
+  'notifyUpcomingBills',
+  'notifyBudgetAlerts',
+  'notifyIncomeAlerts',
+  'notifyRecurringGaps',
+  'savingsGoal',
+] as const
+
+export const CUSTOM_CATEGORY_PALETTE = [
+  '#7B68C8',
+  '#C8A068',
+  '#68C896',
+  '#C86878',
+  '#68B4C8',
+  '#C8C068',
+  '#9868C8',
+  '#68C8B4',
+  '#C89068',
+  '#7898C8',
 ] as const

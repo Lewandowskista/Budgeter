@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
-import type { AppInfo, AppSettings, AppSnapshotSummary, PayeeRule } from '../../shared/types'
+import { X } from 'lucide-react'
+import type { AppInfo, AppSettings, AppSnapshotSummary, CustomCategory, PayeeRule } from '../../shared/types'
+import { toast } from 'sonner'
 import { PageHeader } from '@/components/shared/PageHeader'
 import {
   AlertDialog,
@@ -15,7 +17,7 @@ import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { CURRENCY_OPTIONS, BUDGET_CATEGORIES } from '@/lib/constants'
+import { BUDGET_CATEGORIES, CURRENCY_OPTIONS } from '@/lib/constants'
 import { ipc } from '@/lib/ipc'
 import { useTheme } from '@/lib/theme'
 
@@ -25,6 +27,9 @@ export function SettingsPage() {
   const [snapshots, setSnapshots] = useState<AppSnapshotSummary[]>([])
   const [payeeRules, setPayeeRules] = useState<PayeeRule[]>([])
   const [payeeRuleSearch, setPayeeRuleSearch] = useState('')
+  const [customCategories, setCustomCategories] = useState<CustomCategory[]>([])
+  const [newCategoryName, setNewCategoryName] = useState('')
+  const [addCategoryError, setAddCategoryError] = useState('')
   const [snapshotLabel, setSnapshotLabel] = useState('')
   const [saving, setSaving] = useState(false)
   const [creatingSnapshot, setCreatingSnapshot] = useState(false)
@@ -46,16 +51,38 @@ export function SettingsPage() {
   }, [payeeRuleSearch])
 
   async function loadSettings() {
-    const [currentSettings, currentAppInfo, currentSnapshots, currentPayeeRules] = await Promise.all([
+    const [currentSettings, currentAppInfo, currentSnapshots, currentPayeeRules, categoryResult] = await Promise.all([
       ipc.getSettings(),
       ipc.getAppInfo(),
       ipc.listSnapshots(),
       ipc.getPayeeRules(),
+      ipc.getCategories(),
     ])
     setSettings(currentSettings)
     setAppInfo(currentAppInfo)
     setSnapshots(currentSnapshots)
     setPayeeRules(currentPayeeRules)
+    setCustomCategories(categoryResult.custom)
+  }
+
+  async function addCategory() {
+    const name = newCategoryName.trim()
+    if (!name) return
+    try {
+      const added = await ipc.addCustomCategory({ name })
+      setCustomCategories((current) => [...current, added])
+      setNewCategoryName('')
+      setAddCategoryError('')
+      toast.success(`Category "${name}" added`)
+    } catch (error) {
+      setAddCategoryError(error instanceof Error ? error.message : 'Failed to add category.')
+    }
+  }
+
+  async function removeCategory(id: string) {
+    await ipc.deleteCustomCategory(id)
+    setCustomCategories((current) => current.filter((c) => c.id !== id))
+    toast.success('Category removed')
   }
 
   async function loadPayeeRules(search = '') {
@@ -76,6 +103,7 @@ export function SettingsPage() {
       const saved = await ipc.updateSettings(settings)
       setSettings(saved)
       await setTheme(saved.theme)
+      toast.success('Settings saved')
     } finally {
       setSaving(false)
     }
@@ -87,6 +115,7 @@ export function SettingsPage() {
       await ipc.createSnapshot(snapshotLabel.trim() || undefined)
       setSnapshotLabel('')
       await loadSettings()
+      toast.success('Snapshot created')
     } finally {
       setCreatingSnapshot(false)
     }
@@ -122,6 +151,7 @@ export function SettingsPage() {
       await ipc.deleteSnapshot(deleteTarget.id)
       setDeleteTarget(null)
       await loadSettings()
+      toast.success('Snapshot deleted')
     } finally {
       setDeletingSnapshotId(null)
     }
@@ -140,11 +170,13 @@ export function SettingsPage() {
   async function updatePayeeRule(rule: PayeeRule, category: string) {
     await ipc.upsertPayeeRule({ payee: rule.payeeDisplay, category })
     await loadPayeeRules(payeeRuleSearch)
+    toast.success('Payee rule updated')
   }
 
   async function deletePayeeRule(id: string) {
     await ipc.deletePayeeRule(id)
     await loadPayeeRules(payeeRuleSearch)
+    toast.success('Payee rule removed')
   }
 
   return (
@@ -245,6 +277,82 @@ export function SettingsPage() {
                 </SelectContent>
               </Select>
             </label>
+
+            <label className="grid gap-2 text-sm font-medium text-foreground">
+              Savings rate goal (%)
+              <div className="flex items-center gap-2">
+                <Input
+                  autoComplete="off"
+                  inputMode="decimal"
+                  min="0"
+                  max="100"
+                  name="savings-goal"
+                  type="number"
+                  value={settings.savingsGoal ?? '20'}
+                  onChange={(event) =>
+                    setSettings((current) => (current ? { ...current, savingsGoal: event.target.value } : current))
+                  }
+                />
+                <span className="shrink-0 text-sm text-muted-foreground">% of income</span>
+              </div>
+              <span className="text-xs font-normal text-muted-foreground">Shown as a target on the Dashboard savings rate card.</span>
+            </label>
+
+            <fieldset className="grid gap-2">
+              <legend className="text-sm font-medium text-foreground">Local alerts</legend>
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  checked={settings.notifyUpcomingBills === 'true'}
+                  className="focus-ring size-4 rounded border border-input"
+                  type="checkbox"
+                  onChange={(event) =>
+                    setSettings((current) =>
+                      current ? { ...current, notifyUpcomingBills: event.target.checked ? 'true' : 'false' } : current,
+                    )
+                  }
+                />
+                Upcoming bills and reminder-only recurring items
+              </label>
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  checked={settings.notifyBudgetAlerts === 'true'}
+                  className="focus-ring size-4 rounded border border-input"
+                  type="checkbox"
+                  onChange={(event) =>
+                    setSettings((current) =>
+                      current ? { ...current, notifyBudgetAlerts: event.target.checked ? 'true' : 'false' } : current,
+                    )
+                  }
+                />
+                Budget thresholds and overspending
+              </label>
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  checked={settings.notifyIncomeAlerts === 'true'}
+                  className="focus-ring size-4 rounded border border-input"
+                  type="checkbox"
+                  onChange={(event) =>
+                    setSettings((current) =>
+                      current ? { ...current, notifyIncomeAlerts: event.target.checked ? 'true' : 'false' } : current,
+                    )
+                  }
+                />
+                Missing expected income
+              </label>
+              <label className="flex items-center gap-2 text-sm text-muted-foreground">
+                <input
+                  checked={settings.notifyRecurringGaps === 'true'}
+                  className="focus-ring size-4 rounded border border-input"
+                  type="checkbox"
+                  onChange={(event) =>
+                    setSettings((current) =>
+                      current ? { ...current, notifyRecurringGaps: event.target.checked ? 'true' : 'false' } : current,
+                    )
+                  }
+                />
+                Recurring gaps and missed auto-posts
+              </label>
+            </fieldset>
           </CardContent>
         </Card>
 
@@ -328,16 +436,91 @@ export function SettingsPage() {
 
           <Card className="border-border/80 bg-card/90">
             <CardHeader>
+              <CardTitle>Categories</CardTitle>
+              <CardDescription>Built-in categories are fixed. Add your own custom categories for transactions and budgets.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4">
+              <div className="grid gap-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Built-in</p>
+                <div className="flex flex-wrap gap-2">
+                  {BUDGET_CATEGORIES.map((cat) => (
+                    <span key={cat} className="inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-muted/30 px-3 py-1 text-sm text-foreground">
+                      {cat}
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              {customCategories.length > 0 && (
+                <div className="grid gap-2">
+                  <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Custom</p>
+                  <div className="grid gap-2">
+                    {customCategories.map((cat) => (
+                      <div key={cat.id} className="flex items-center justify-between gap-3 rounded-2xl border border-border/80 bg-muted/20 px-4 py-2">
+                        <div className="flex items-center gap-2">
+                          <span className="size-3 rounded-full flex-shrink-0" style={{ backgroundColor: cat.color }} />
+                          <span className="text-sm font-medium text-foreground">{cat.name}</span>
+                        </div>
+                        <Button variant="ghost" size="sm" onClick={() => void removeCategory(cat.id)}>
+                          Delete
+                        </Button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="grid gap-2">
+                <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Add custom category</p>
+                <div className="flex gap-2">
+                  <Input
+                    autoComplete="off"
+                    placeholder="e.g. Pet Care, Gym, Kids"
+                    value={newCategoryName}
+                    onChange={(event) => {
+                      setNewCategoryName(event.target.value)
+                      setAddCategoryError('')
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        event.preventDefault()
+                        void addCategory()
+                      }
+                    }}
+                  />
+                  <Button onClick={() => void addCategory()} disabled={!newCategoryName.trim()}>Add</Button>
+                </div>
+                {addCategoryError ? <p className="text-sm text-destructive">{addCategoryError}</p> : null}
+                <p className="text-xs text-muted-foreground">Deleting a custom category keeps existing transactions — they retain their label.</p>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="border-border/80 bg-card/90">
+            <CardHeader>
               <CardTitle>Payee rules</CardTitle>
               <CardDescription>Review and adjust local payee-to-category mappings used by manual entry and CSV import.</CardDescription>
             </CardHeader>
             <CardContent className="grid gap-3">
-              <Input
-                autoComplete="off"
-                placeholder="Search payees…"
-                value={payeeRuleSearch}
-                onChange={(event) => setPayeeRuleSearch(event.target.value)}
-              />
+              <label className="relative">
+                <Input
+                  autoComplete="off"
+                  placeholder="Search payees…"
+                  value={payeeRuleSearch}
+                  className={payeeRuleSearch ? 'pr-9' : ''}
+                  onChange={(event) => setPayeeRuleSearch(event.target.value)}
+                />
+                {payeeRuleSearch && (
+                  <button
+                    type="button"
+                    aria-label="Clear search"
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+                    onClick={() => setPayeeRuleSearch('')}
+                  >
+                    <X className="size-4" />
+                  </button>
+                )}
+              </label>
               {payeeRules.length ? (
                 payeeRules.map((rule) => (
                   <div key={rule.id} className="grid gap-3 rounded-2xl border border-border/80 bg-muted/20 px-4 py-3 sm:grid-cols-[1fr_auto_auto] sm:items-center">

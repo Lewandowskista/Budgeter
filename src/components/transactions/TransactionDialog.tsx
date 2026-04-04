@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { AlertTriangle } from 'lucide-react'
 import type { IncomeSource, Transaction, TransactionInput, TransactionType } from '../../../shared/types'
 import { BUDGET_CATEGORIES, INCOME_SOURCES } from '@/lib/constants'
 import { Button } from '@/components/ui/button'
@@ -21,20 +22,20 @@ interface TransactionDialogProps {
   onOpenChange: (open: boolean) => void
   initialValue?: Transaction | null
   onSubmit: (value: TransactionInput, options: { rememberPayeeRule: boolean }) => Promise<void>
+  categories?: string[]
 }
 
-const blankTransaction: TransactionInput = {
-  amount: 0,
-  type: 'expense',
-  category: BUDGET_CATEGORIES[0],
-  incomeSource: null,
-  payee: '',
-  date: new Date().toISOString().slice(0, 10),
-  note: '',
-}
-
-export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }: TransactionDialogProps) {
-  const [form, setForm] = useState<TransactionInput>(blankTransaction)
+export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit, categories = [...BUDGET_CATEGORIES] }: TransactionDialogProps) {
+  const defaultCategory = categories[0] ?? BUDGET_CATEGORIES[0]
+  const [form, setForm] = useState<TransactionInput>({
+    amount: 0,
+    type: 'expense',
+    category: defaultCategory,
+    incomeSource: null,
+    payee: '',
+    date: new Date().toISOString().slice(0, 10),
+    note: '',
+  })
   const [saving, setSaving] = useState(false)
   const [errors, setErrors] = useState<ValidationErrors>({})
   const [rememberPayeeRule, setRememberPayeeRule] = useState(false)
@@ -61,8 +62,13 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
       setRememberPayeeRule(false)
       setCategoryTouched(false)
       setForm({
-        ...blankTransaction,
+        amount: 0,
+        type: 'expense',
+        category: defaultCategory,
+        incomeSource: null,
+        payee: '',
         date: new Date().toISOString().slice(0, 10),
+        note: '',
       })
     }
   }, [initialValue, open])
@@ -130,7 +136,7 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
         : {
             ...current,
             type,
-            category: current.category ?? BUDGET_CATEGORIES[0],
+            category: current.category ?? defaultCategory,
             incomeSource: null,
           },
     )
@@ -153,11 +159,13 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
         <form className="grid gap-4" onSubmit={handleSubmit}>
           <div className="grid gap-2">
             <span className="text-sm font-medium text-foreground">Type</span>
-            <div className="flex gap-2">
+            <div className="flex gap-2" role="radiogroup" aria-label="Transaction type">
               {(['expense', 'income'] as TransactionType[]).map((type) => (
                 <Button
                   key={type}
                   type="button"
+                  role="radio"
+                  aria-checked={form.type === type}
                   variant={form.type === type ? 'default' : 'outline'}
                   onClick={() => updateType(type)}
                 >
@@ -197,6 +205,19 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
                 value={form.date}
                 onChange={(event) => updateField('date', event.target.value)}
               />
+              {(() => {
+                const sevenDaysOut = new Date(Date.now() + 7 * 86_400_000).toISOString().slice(0, 10)
+                if (form.date > sevenDaysOut) {
+                  const monthLabel = new Date(form.date + 'T12:00:00').toLocaleDateString(undefined, { month: 'long', year: 'numeric' })
+                  return (
+                    <span role="alert" className="flex items-center gap-1.5 text-xs text-amber-600 dark:text-amber-400">
+                      <AlertTriangle className="size-3 shrink-0" aria-hidden="true" />
+                      This transaction is dated in the future and will appear in {monthLabel} analytics.
+                    </span>
+                  )
+                }
+                return null
+              })()}
             </label>
           </div>
 
@@ -230,7 +251,7 @@ export function TransactionDialog({ open, onOpenChange, initialValue, onSubmit }
                     <SelectValue placeholder="Select a category" />
                   </SelectTrigger>
                   <SelectContent>
-                    {BUDGET_CATEGORIES.map((category) => (
+                    {categories.map((category) => (
                       <SelectItem key={category} value={category}>
                         {category}
                       </SelectItem>

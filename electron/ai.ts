@@ -1,6 +1,16 @@
+import { randomUUID } from 'node:crypto'
 import { GoogleGenAI } from '@google/genai'
 import { DEFAULT_SETTINGS } from '../shared/constants'
-import type { AIAnalysisResult, AIComparison, AppSettings, BenchmarkConfidence } from '../shared/types'
+import type {
+  AIAnalysisProgress,
+  AIAnalysisProviderKey,
+  AIAnalysisProviderStatus,
+  AIAnalysisResult,
+  AIAnalysisStage,
+  AIComparison,
+  AppSettings,
+  BenchmarkConfidence,
+} from '../shared/types'
 import type { DatabaseManager } from './database'
 
 const ECB_FX_RATES_URL = 'https://www.ecb.europa.eu/stats/eurofxref/eurofxref-daily.xml'
@@ -13,6 +23,15 @@ const CACHE_TTL_MS = 24 * 60 * 60 * 1000
 const CITY_ESTIMATE_TTL_MS = 30 * 24 * 60 * 60 * 1000
 const FREE_PROVIDER_VERSION = 'free-hybrid-v1'
 const CITY_ESTIMATE_VERSION = 'city-estimate-v1'
+const DEFAULT_PROVIDER_TIMEOUT_MS: Record<AIAnalysisProviderKey, number> = {
+  wteCost: 8_000,
+  wteQuality: 8_000,
+  wteDocs: 8_000,
+  worldBank: 10_000,
+  ecb: 8_000,
+  geminiCityEstimate: 12_000,
+  geminiInsights: 20_000,
+}
 
 interface CityCostRecord {
   country: string
@@ -65,6 +84,7 @@ interface BenchmarkProfile {
   countryContext: CountryContext | null
   benchmarkLevel: 'city' | 'ai-city' | 'country' | 'global'
   benchmarkSummary: string
+  fallbackSummary?: string
   dataSources: string[]
   sourceRecency: string[]
   fxRate: number
@@ -84,6 +104,37 @@ interface CachedAnalysisRow {
   created_at: string
 }
 
+interface AnalyzeInsightsOptions {
+  requestId?: string
+  onProgress?: (progress: AIAnalysisProgress) => void
+  client?: Pick<GoogleGenAI, 'models'>
+  fetchImpl?: typeof fetch
+  timeoutsMs?: Partial<Record<AIAnalysisProviderKey, number>>
+  log?: (message: string, details?: Record<string, unknown>) => void
+}
+
+interface GeminiRequest {
+  model: string
+  contents: string
+  config: {
+    temperature: number
+    responseMimeType: 'application/json'
+  }
+}
+
+interface ProgressTracker {
+  emit: (update: Partial<Omit<AIAnalysisProgress, 'requestId' | 'providerStatuses'>> & { providerStatuses?: AIAnalysisProgress['providerStatuses'] }) => void
+  updateProvider: (provider: AIAnalysisProviderKey, status: AIAnalysisProviderStatus) => void
+  getSnapshot: () => AIAnalysisProgress
+}
+
+class ProviderTimeoutError extends Error {
+  constructor(provider: AIAnalysisProviderKey, timeoutMs: number) {
+    super(`${provider} timed out after ${timeoutMs}ms.`)
+    this.name = 'ProviderTimeoutError'
+  }
+}
+
 const COUNTRY_ALIASES: Record<string, string> = {
   usa: 'united states',
   'united states of america': 'united states',
@@ -99,32 +150,85 @@ export async function analyzeInsights(
   database: DatabaseManager,
   periodMonth: string,
   refresh = false,
+  options: AnalyzeInsightsOptions = {},
 ): Promise<AIAnalysisResult> {
+  const requestId = options.requestId ?? randomUUID()
+  const progress = createProgressTracker(requestId, options.onProgress)
+  const fetchImpl = options.fetchImpl ?? fetch
+  const log = options.log ?? defaultLog
   const settings = { ...DEFAULT_SETTINGS, ...database.getSettings() }
   validateSettings(settings)
-  const client = new GoogleGenAI({ apiKey: settings.geminiApiKey })
+  const client = options.client ?? new GoogleGenAI({ apiKey: settings.geminiApiKey })
+  const timeoutsMs = { ...DEFAULT_PROVIDER_TIMEOUT_MS, ...options.timeoutsMs }
+
+  progress.emit({
+    stage: 'checking-cache',
+    message: 'Checking cached analysis',
+    percent: 8,
+    isTerminal: false,
+  })
 
   const cacheKey = `${FREE_PROVIDER_VERSION}:${periodMonth}:${settings.city}:${settings.country}:${settings.currency}`
   const cached = database.getCache(cacheKey)
   const reusableCachedAnalysis = readCachedAnalysis(cached, refresh)
 
   if (reusableCachedAnalysis) {
+    progress.emit({
+      stage: 'completed',
+      message: 'Loaded cached analysis',
+      percent: 100,
+      isTerminal: true,
+      usedCache: true,
+      cachedAt: reusableCachedAnalysis.cachedAt,
+      fallbackSummary: getFallbackSummary(reusableCachedAnalysis.benchmarkLevel),
+    })
     return reusableCachedAnalysis
   }
 
   try {
+    progress.emit({
+      stage: 'loading-transactions',
+      message: 'Loading monthly spending data',
+      percent: 18,
+      isTerminal: false,
+    })
     const snapshot = database.getMonthlySpendingSnapshot(periodMonth)
-    const benchmark = await buildBenchmarkProfile(database, client, settings)
+    progress.emit({
+      stage: 'fetching-benchmarks',
+      message: 'Checking public benchmark services',
+      percent: 40,
+      isTerminal: false,
+    })
+    const benchmark = await buildBenchmarkProfile(database, client, settings, {
+      fetchImpl,
+      progress,
+      timeoutsMs,
+      log,
+    })
     const baselineComparisons = buildComparisons(snapshot.spendingByCategory, snapshot.totalIncome, benchmark)
 
-    const response = await client.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: buildPrompt(settings, periodMonth, baselineComparisons, benchmark, snapshot.totalIncome),
-      config: {
-        temperature: 0.3,
-        responseMimeType: 'application/json',
-      },
+    progress.emit({
+      stage: 'generating-insights',
+      message: 'Generating personalized AI insights',
+      percent: 84,
+      isTerminal: false,
+      fallbackSummary: benchmark.fallbackSummary,
     })
+    const response = await runGeminiRequest(
+      'geminiInsights',
+      client,
+      {
+        model: 'gemini-2.5-flash',
+        contents: buildPrompt(settings, periodMonth, baselineComparisons, benchmark, snapshot),
+        config: {
+          temperature: 0.3,
+          responseMimeType: 'application/json',
+        },
+      },
+      progress,
+      timeoutsMs.geminiInsights,
+      log,
+    )
 
     const parsed = parseJson(response.text)
     const result: AIAnalysisResult = {
@@ -135,7 +239,10 @@ export async function analyzeInsights(
         typeof parsed.explanation === 'string'
           ? parsed.explanation
           : 'Your budget is broadly stable, with a few categories that could be tightened.',
+      varianceSummary: typeof parsed.varianceSummary === 'string' ? parsed.varianceSummary : undefined,
       tips: Array.isArray(parsed.tips) ? parsed.tips.filter(isNonEmptyString).slice(0, 5) : [],
+      riskSignals: Array.isArray(parsed.riskSignals) ? parsed.riskSignals.filter(isNonEmptyString).slice(0, 4) : [],
+      safeCutIdeas: Array.isArray(parsed.safeCutIdeas) ? parsed.safeCutIdeas.filter(isNonEmptyString).slice(0, 4) : [],
       positives: Array.isArray(parsed.positives) ? parsed.positives.filter(isNonEmptyString).slice(0, 5) : [],
       comparisons: baselineComparisons,
       benchmarkLevel: benchmark.benchmarkLevel,
@@ -147,14 +254,77 @@ export async function analyzeInsights(
     }
 
     database.setCache(cacheKey, result)
+    progress.emit({
+      stage: 'completed',
+      message: 'AI insights ready',
+      percent: 100,
+      isTerminal: true,
+      fallbackSummary: benchmark.fallbackSummary,
+      cachedAt: result.cachedAt,
+    })
     return result
   } catch (error) {
-    if (reusableCachedAnalysis) {
-      return reusableCachedAnalysis
-    }
-
+    const message = error instanceof Error ? error.message : 'AI analysis failed.'
+    progress.emit({
+      stage: 'failed',
+      message: 'AI analysis failed',
+      percent: 100,
+      isTerminal: true,
+      error: message,
+    })
     throw error
   }
+}
+
+function createProgressTracker(requestId: string, onProgress?: (progress: AIAnalysisProgress) => void): ProgressTracker {
+  let snapshot: AIAnalysisProgress = {
+    requestId,
+    stage: 'checking-cache',
+    message: 'Checking cached analysis',
+    percent: 0,
+    isTerminal: false,
+    providerStatuses: {},
+  }
+
+  function publish() {
+    onProgress?.({
+      ...snapshot,
+      providerStatuses: { ...snapshot.providerStatuses },
+    })
+  }
+
+  return {
+    emit(update) {
+      snapshot = {
+        ...snapshot,
+        ...update,
+        providerStatuses: update.providerStatuses ? { ...snapshot.providerStatuses, ...update.providerStatuses } : snapshot.providerStatuses,
+      }
+      publish()
+    },
+    updateProvider(provider, status) {
+      snapshot = {
+        ...snapshot,
+        providerStatuses: {
+          ...snapshot.providerStatuses,
+          [provider]: status,
+        },
+      }
+      publish()
+    },
+    getSnapshot() {
+      return snapshot
+    },
+  }
+}
+
+function defaultLog(message: string, details?: Record<string, unknown>) {
+  if (details) {
+    console.info(`[AI Insights] ${message}`, details)
+    return
+  }
+
+  console.info(`[AI Insights] ${message}`)
 }
 
 export function readCachedAnalysis(
@@ -247,7 +417,7 @@ function buildPrompt(
   periodMonth: string,
   comparisons: AIComparison[],
   benchmark: BenchmarkProfile,
-  totalIncome: number,
+  snapshot: ReturnType<DatabaseManager['getMonthlySpendingSnapshot']>,
 ) {
   return `
 You are a personal finance advisor.
@@ -255,7 +425,8 @@ You are a personal finance advisor.
 User location: ${settings.city}, ${settings.country}
 Analysis month: ${periodMonth}
 Current date: ${new Date().toISOString().slice(0, 10)}
-User monthly income: ${totalIncome}
+User monthly income: ${snapshot.totalIncome}
+User monthly spending total: ${snapshot.totalSpent}
 Benchmark summary: ${benchmark.benchmarkSummary}
 Free public data sources:
 - ${benchmark.dataSources.join('\n- ')}
@@ -272,17 +443,35 @@ ${JSON.stringify(benchmark.quality, null, 2)}
 Estimated local spending benchmarks by category:
 ${JSON.stringify(comparisons, null, 2)}
 
+Month-over-month category changes:
+${JSON.stringify(snapshot.monthOverMonthChanges, null, 2)}
+
+Upcoming recurring commitments still due this month:
+${JSON.stringify(snapshot.upcomingBills, null, 2)}
+
+Budget overview:
+${JSON.stringify(snapshot.budgetOverview, null, 2)}
+
+Pending review transaction count:
+${snapshot.pendingReviewCount}
+
 Respond strictly as JSON:
 {
   "healthScore": 0,
   "explanation": "",
+  "varianceSummary": "",
   "tips": ["", ""],
+  "riskSignals": ["", ""],
+  "safeCutIdeas": ["", ""],
   "positives": ["", ""]
 }
 
 Requirements:
 - Score between 1 and 100
+- varianceSummary should explain what changed from last month in plain language
 - 3 to 5 actionable tips
+- 1 to 4 riskSignals about recurring bills, rollover pressure, or pending review items
+- 1 to 4 safeCutIdeas that reduce spending with low disruption
 - 2 to 4 positive patterns
 - Treat the supplied benchmarks as estimates, not exact audited prices
 - Base the advice on the supplied local estimates and user spending
@@ -312,15 +501,25 @@ function clampNumber(value: unknown, min: number, max: number, fallback: number)
 
 async function buildBenchmarkProfile(
   database: DatabaseManager,
-  client: GoogleGenAI,
+  client: Pick<GoogleGenAI, 'models'>,
   settings: AppSettings,
+  context: {
+    fetchImpl: typeof fetch
+    progress: ProgressTracker
+    timeoutsMs: Record<AIAnalysisProviderKey, number>
+    log: (message: string, details?: Record<string, unknown>) => void
+  },
 ): Promise<BenchmarkProfile> {
+  if (settings.currency === 'EUR') {
+    context.progress.updateProvider('ecb', { state: 'skipped', detail: 'EUR selected, no conversion needed.' })
+  }
+
   const [wteDocsResult, costResult, qualityResult, countryContextResult, fxRateResult] = await Promise.allSettled([
-    fetchWteApiDocUpdateDates(),
-    fetchJsonWithMeta<CityCostRecord[]>(WTE_COST_INDEX_URL),
-    fetchJsonWithMeta<QualityIndexRecord[]>(WTE_QUALITY_INDEX_URL),
-    fetchCountryContext(settings.country),
-    fetchFxRate(settings.currency),
+    fetchWteApiDocUpdateDates(context.fetchImpl, context.progress, context.timeoutsMs.wteDocs, context.log),
+    fetchJsonWithMeta<CityCostRecord[]>(WTE_COST_INDEX_URL, 'wteCost', 'application/json', context.fetchImpl, context.progress, context.timeoutsMs.wteCost, context.log),
+    fetchJsonWithMeta<QualityIndexRecord[]>(WTE_QUALITY_INDEX_URL, 'wteQuality', 'application/json', context.fetchImpl, context.progress, context.timeoutsMs.wteQuality, context.log),
+    fetchCountryContext(settings.country, context.fetchImpl, context.progress, context.timeoutsMs.worldBank, context.log),
+    fetchFxRate(settings.currency, context.fetchImpl, context.progress, context.timeoutsMs.ecb, context.log),
   ])
 
   if (fxRateResult.status !== 'fulfilled') {
@@ -340,16 +539,27 @@ async function buildBenchmarkProfile(
     cityCost = getCachedCityEstimate(database, settings)
     if (cityCost) {
       benchmarkLevel = 'ai-city'
+      context.progress.updateProvider('geminiCityEstimate', {
+        state: 'fallback',
+        detail: 'Using cached city estimate from a previous Gemini fallback.',
+      })
     }
   }
 
   if (!cityCost) {
+    context.progress.emit({
+      stage: 'estimating-city',
+      message: 'Estimating city benchmark with Gemini fallback',
+      percent: 62,
+      isTerminal: false,
+      fallbackSummary: 'Direct city benchmark unavailable, preparing fallback sources.',
+    })
     cityCost = await inferCityCostWithAI(client, settings, {
       countryRecords,
       countryAverage,
       globalAverage,
       countryContext: countryContextResult.status === 'fulfilled' ? countryContextResult.value : null,
-    })
+    }, context.progress, context.timeoutsMs.geminiCityEstimate, context.log)
 
     if (cityCost) {
       benchmarkLevel = 'ai-city'
@@ -360,11 +570,17 @@ async function buildBenchmarkProfile(
   if (!cityCost && countryAverage) {
     cityCost = countryAverage
     benchmarkLevel = 'country'
+    context.progress.emit({
+      fallbackSummary: 'Direct city benchmark unavailable, using country-level average data.',
+    })
   }
 
   if (!cityCost && globalAverage) {
     cityCost = globalAverage
     benchmarkLevel = 'global'
+    context.progress.emit({
+      fallbackSummary: 'Direct city and country benchmarks unavailable, using a global proxy.',
+    })
   }
 
   if (!cityCost) {
@@ -393,6 +609,7 @@ async function buildBenchmarkProfile(
     countryContext,
     benchmarkLevel,
     benchmarkSummary: buildBenchmarkSummary(benchmarkLevel, cityCost, settings),
+    fallbackSummary: getFallbackSummary(benchmarkLevel),
     dataSources: buildDataSources({
       currency: settings.currency,
       benchmarkLevel,
@@ -409,87 +626,217 @@ async function buildBenchmarkProfile(
   }
 }
 
-async function fetchCountryContext(countryName: string): Promise<CountryContext | null> {
-  const response = await fetchJson<[unknown, WorldBankCountryRecord[]]>(WORLD_BANK_COUNTRIES_URL)
-  const countries = Array.isArray(response[1]) ? response[1] : []
-  const country = countries.find((item) => isSameCountry(item.name, countryName))
+async function fetchCountryContext(
+  countryName: string,
+  fetchImpl: typeof fetch,
+  progress: ProgressTracker,
+  timeoutMs: number,
+  log: (message: string, details?: Record<string, unknown>) => void,
+): Promise<CountryContext | null> {
+  progress.updateProvider('worldBank', { state: 'pending', detail: 'Fetching country context.' })
+  const startedAt = Date.now()
 
-  if (!country) {
-    return null
-  }
+  try {
+    const response = await fetchJson<[unknown, WorldBankCountryRecord[]]>(WORLD_BANK_COUNTRIES_URL, fetchImpl, timeoutMs, 'worldBank')
+    const countries = Array.isArray(response[1]) ? response[1] : []
+    const country = countries.find((item) => isSameCountry(item.name, countryName))
 
-  const inflationResponse = await fetchJson<[unknown, WorldBankIndicatorRecord[]]>(
-    `${WORLD_BANK_INFLATION_BASE_URL}/${country.iso2Code.toLowerCase()}/indicator/FP.CPI.TOTL.ZG?format=json&mrnev=1&gapfill=Y`,
-  )
-  const inflationRecords = Array.isArray(inflationResponse[1]) ? inflationResponse[1] : []
-  const latestInflationRecord = inflationRecords.find((record) => typeof record.value === 'number') ?? null
-  const inflationRate = latestInflationRecord?.value ?? null
-  const inflationAsOf = latestInflationRecord?.date ?? null
+    if (!country) {
+      progress.updateProvider('worldBank', {
+        state: 'success',
+        detail: `No World Bank country match for ${countryName}.`,
+        durationMs: Date.now() - startedAt,
+      })
+      return null
+    }
 
-  return {
-    iso2Code: country.iso2Code,
-    name: country.name,
-    region: country.region?.value || 'Unknown region',
-    incomeLevel: country.incomeLevel?.value || 'Unknown income group',
-    inflationRate,
-    inflationAsOf,
+    const inflationResponse = await fetchJson<[unknown, WorldBankIndicatorRecord[]]>(
+      `${WORLD_BANK_INFLATION_BASE_URL}/${country.iso2Code.toLowerCase()}/indicator/FP.CPI.TOTL.ZG?format=json&mrnev=1&gapfill=Y`,
+      fetchImpl,
+      timeoutMs,
+      'worldBank',
+    )
+    const inflationRecords = Array.isArray(inflationResponse[1]) ? inflationResponse[1] : []
+    const latestInflationRecord = inflationRecords.find((record) => typeof record.value === 'number') ?? null
+    const inflationRate = latestInflationRecord?.value ?? null
+    const inflationAsOf = latestInflationRecord?.date ?? null
+
+    const result = {
+      iso2Code: country.iso2Code,
+      name: country.name,
+      region: country.region?.value || 'Unknown region',
+      incomeLevel: country.incomeLevel?.value || 'Unknown income group',
+      inflationRate,
+      inflationAsOf,
+    }
+    progress.updateProvider('worldBank', {
+      state: 'success',
+      detail: 'Country context loaded.',
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider completed', { provider: 'worldBank', durationMs: Date.now() - startedAt, country: country.name })
+    return result
+  } catch (error) {
+    const status = toProviderFailureStatus(error)
+    progress.updateProvider('worldBank', {
+      state: status,
+      detail: getErrorMessage(error),
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider failed', { provider: 'worldBank', state: status, error: getErrorMessage(error) })
+    throw error
   }
 }
 
-async function fetchFxRate(currency: string): Promise<{ rate: number; asOf: string | null }> {
+async function fetchFxRate(
+  currency: string,
+  fetchImpl: typeof fetch,
+  progress: ProgressTracker,
+  timeoutMs: number,
+  log: (message: string, details?: Record<string, unknown>) => void,
+): Promise<{ rate: number; asOf: string | null }> {
   if (currency === 'EUR') {
     return { rate: 1, asOf: new Date().toISOString().slice(0, 10) }
   }
 
-  const response = await fetch(ECB_FX_RATES_URL, { headers: { Accept: 'application/xml,text/xml' } })
-  if (!response.ok) {
-    throw new Error(`ECB exchange rate request failed with status ${response.status}.`)
+  progress.updateProvider('ecb', { state: 'pending', detail: `Fetching ${currency} conversion rate.` })
+  const startedAt = Date.now()
+
+  try {
+    const response = await fetchWithTimeout('ecb', ECB_FX_RATES_URL, fetchImpl, timeoutMs, { Accept: 'application/xml,text/xml' })
+    if (!response.ok) {
+      throw new Error(`ECB exchange rate request failed with status ${response.status}.`)
+    }
+
+    const xml = await response.text()
+    const asOf = xml.match(/time=['"](\d{4}-\d{2}-\d{2})['"]/)?.[1] ?? null
+    const matches = xml.matchAll(/currency=['"]([A-Z]{3})['"]\s+rate=['"]([\d.]+)['"]/g)
+    const rates = new Map<string, number>()
+
+    for (const match of matches) {
+      rates.set(match[1], Number(match[2]))
+    }
+
+    const rate = rates.get(currency)
+    if (!rate) {
+      throw new Error(`No ECB exchange rate was found for ${currency}.`)
+    }
+
+    progress.updateProvider('ecb', {
+      state: 'success',
+      detail: `Loaded ${currency} conversion rate.`,
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider completed', { provider: 'ecb', durationMs: Date.now() - startedAt, currency })
+    return { rate, asOf }
+  } catch (error) {
+    const status = toProviderFailureStatus(error)
+    progress.updateProvider('ecb', {
+      state: status,
+      detail: getErrorMessage(error),
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider failed', { provider: 'ecb', state: status, error: getErrorMessage(error) })
+    throw error
   }
-
-  const xml = await response.text()
-  const asOf = xml.match(/time=['"](\d{4}-\d{2}-\d{2})['"]/)?.[1] ?? null
-  const matches = xml.matchAll(/currency=['"]([A-Z]{3})['"]\s+rate=['"]([\d.]+)['"]/g)
-  const rates = new Map<string, number>()
-
-  for (const match of matches) {
-    rates.set(match[1], Number(match[2]))
-  }
-
-  const rate = rates.get(currency)
-  if (!rate) {
-    throw new Error(`No ECB exchange rate was found for ${currency}.`)
-  }
-
-  return { rate, asOf }
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  return (await fetchJsonWithMeta<T>(url)).data
+async function fetchJson<T>(
+  url: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+  provider: AIAnalysisProviderKey,
+): Promise<T> {
+  return (await fetchJsonWithMeta<T>(url, provider, 'application/json', fetchImpl, undefined, timeoutMs)).data
 }
 
-async function fetchJsonWithMeta<T>(url: string): Promise<{ data: T; lastModified: string | null }> {
-  const response = await fetch(url, { headers: { Accept: 'application/json' } })
-  if (!response.ok) {
-    throw new Error(`Request failed with status ${response.status}.`)
+async function fetchJsonWithMeta<T>(
+  url: string,
+  provider?: AIAnalysisProviderKey,
+  accept = 'application/json',
+  fetchImpl: typeof fetch = fetch,
+  progress?: ProgressTracker,
+  timeoutMs = 8_000,
+  log?: (message: string, details?: Record<string, unknown>) => void,
+): Promise<{ data: T; lastModified: string | null }> {
+  const startedAt = Date.now()
+
+  if (provider && progress) {
+    progress.updateProvider(provider, { state: 'pending', detail: `Fetching ${provider}.` })
   }
 
-  return {
-    data: (await response.json()) as T,
-    lastModified: normalizeHttpDate(response.headers.get('last-modified') ?? response.headers.get('date')),
+  try {
+    const response = await fetchWithTimeout(provider ?? 'wteDocs', url, fetchImpl, timeoutMs, { Accept: accept })
+    if (!response.ok) {
+      throw new Error(`Request failed with status ${response.status}.`)
+    }
+
+    const result = {
+      data: (await response.json()) as T,
+      lastModified: normalizeHttpDate(response.headers.get('last-modified') ?? response.headers.get('date')),
+    }
+
+    if (provider && progress) {
+      progress.updateProvider(provider, {
+        state: 'success',
+        detail: `${provider} responded successfully.`,
+        durationMs: Date.now() - startedAt,
+      })
+    }
+
+    log?.('Provider completed', { provider, durationMs: Date.now() - startedAt, url })
+    return result
+  } catch (error) {
+    if (provider && progress) {
+      const status = toProviderFailureStatus(error)
+      progress.updateProvider(provider, {
+        state: status,
+        detail: getErrorMessage(error),
+        durationMs: Date.now() - startedAt,
+      })
+      log?.('Provider failed', { provider, state: status, error: getErrorMessage(error), url })
+    }
+
+    throw error
   }
 }
 
-async function fetchWteApiDocUpdateDates(): Promise<WteApiDocUpdateDates> {
-  const response = await fetch(WTE_API_DOCS_URL, { headers: { Accept: 'text/html' } })
-  if (!response.ok) {
-    throw new Error(`WTE API docs request failed with status ${response.status}.`)
-  }
+async function fetchWteApiDocUpdateDates(
+  fetchImpl: typeof fetch,
+  progress: ProgressTracker,
+  timeoutMs: number,
+  log: (message: string, details?: Record<string, unknown>) => void,
+): Promise<WteApiDocUpdateDates> {
+  const startedAt = Date.now()
+  progress.updateProvider('wteDocs', { state: 'pending', detail: 'Checking WhereToEmigrate API docs.' })
 
-  const html = await response.text()
+  try {
+    const response = await fetchWithTimeout('wteDocs', WTE_API_DOCS_URL, fetchImpl, timeoutMs, { Accept: 'text/html' })
+    if (!response.ok) {
+      throw new Error(`WTE API docs request failed with status ${response.status}.`)
+    }
 
-  return {
-    costIndexUpdatedAt: extractWteUpdatedAt(html, '/api/cost-index'),
-    qualityIndexUpdatedAt: extractWteUpdatedAt(html, '/api/quality-index'),
+    const html = await response.text()
+    const result = {
+      costIndexUpdatedAt: extractWteUpdatedAt(html, '/api/cost-index'),
+      qualityIndexUpdatedAt: extractWteUpdatedAt(html, '/api/quality-index'),
+    }
+    progress.updateProvider('wteDocs', {
+      state: 'success',
+      detail: 'WhereToEmigrate API docs loaded.',
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider completed', { provider: 'wteDocs', durationMs: Date.now() - startedAt })
+    return result
+  } catch (error) {
+    const status = toProviderFailureStatus(error)
+    progress.updateProvider('wteDocs', {
+      state: status,
+      detail: getErrorMessage(error),
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider failed', { provider: 'wteDocs', state: status, error: getErrorMessage(error) })
+    throw error
   }
 }
 
@@ -512,7 +859,7 @@ function getCachedCityEstimate(database: DatabaseManager, settings: AppSettings)
 }
 
 async function inferCityCostWithAI(
-  client: GoogleGenAI,
+  client: Pick<GoogleGenAI, 'models'>,
   settings: AppSettings,
   context: {
     countryRecords: CityCostRecord[]
@@ -520,19 +867,128 @@ async function inferCityCostWithAI(
     globalAverage: CityCostRecord | null
     countryContext: CountryContext | null
   },
+  progress: ProgressTracker,
+  timeoutMs: number,
+  log: (message: string, details?: Record<string, unknown>) => void,
 ) {
   const sampleCountryRecords = context.countryRecords.slice(0, 8)
-  const response = await client.models.generateContent({
-    model: 'gemini-2.5-flash',
-    contents: buildCityEstimatePrompt(settings, context, sampleCountryRecords),
-    config: {
-      temperature: 0.2,
-      responseMimeType: 'application/json',
+  const response = await runGeminiRequest(
+    'geminiCityEstimate',
+    client,
+    {
+      model: 'gemini-2.5-flash',
+      contents: buildCityEstimatePrompt(settings, context, sampleCountryRecords),
+      config: {
+        temperature: 0.2,
+        responseMimeType: 'application/json',
+      },
     },
-  })
+    progress,
+    timeoutMs,
+    log,
+  )
 
   const parsed = parseJson(response.text)
   return normalizeCityCostRecord(parsed, settings)
+}
+
+function getFallbackSummary(level: AIAnalysisResult['benchmarkLevel']) {
+  if (level === 'ai-city') {
+    return 'Direct city benchmark unavailable, using AI-estimated city data.'
+  }
+
+  if (level === 'country') {
+    return 'Direct city benchmark unavailable, using country-level average data.'
+  }
+
+  if (level === 'global') {
+    return 'Direct city and country benchmarks unavailable, using a global proxy.'
+  }
+
+  return undefined
+}
+
+async function fetchWithTimeout(
+  provider: AIAnalysisProviderKey,
+  url: string,
+  fetchImpl: typeof fetch,
+  timeoutMs: number,
+  headers: Record<string, string>,
+) {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(new ProviderTimeoutError(provider, timeoutMs)), timeoutMs)
+
+  try {
+    return await fetchImpl(url, {
+      headers,
+      signal: controller.signal,
+    })
+  } catch (error) {
+    if (controller.signal.aborted) {
+      throw new ProviderTimeoutError(provider, timeoutMs)
+    }
+
+    throw error
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+async function runGeminiRequest(
+  provider: 'geminiCityEstimate' | 'geminiInsights',
+  client: Pick<GoogleGenAI, 'models'>,
+  input: GeminiRequest,
+  progress: ProgressTracker,
+  timeoutMs: number,
+  log: (message: string, details?: Record<string, unknown>) => void,
+) {
+  progress.updateProvider(provider, { state: 'pending', detail: `Calling ${provider}.` })
+  const startedAt = Date.now()
+
+  try {
+    const response = await withPromiseTimeout(client.models.generateContent(input), provider, timeoutMs)
+    progress.updateProvider(provider, {
+      state: 'success',
+      detail: `${provider} completed.`,
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider completed', { provider, durationMs: Date.now() - startedAt })
+    return response
+  } catch (error) {
+    const status = toProviderFailureStatus(error)
+    progress.updateProvider(provider, {
+      state: status,
+      detail: getErrorMessage(error),
+      durationMs: Date.now() - startedAt,
+    })
+    log('Provider failed', { provider, state: status, error: getErrorMessage(error) })
+    throw error
+  }
+}
+
+async function withPromiseTimeout<T>(promise: Promise<T>, provider: AIAnalysisProviderKey, timeoutMs: number) {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutId = setTimeout(() => reject(new ProviderTimeoutError(provider, timeoutMs)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timeoutId) {
+      clearTimeout(timeoutId)
+    }
+  }
+}
+
+function toProviderFailureStatus(error: unknown): AIAnalysisProviderStatus['state'] {
+  return error instanceof ProviderTimeoutError ? 'timeout' : 'failed'
+}
+
+function getErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function averageCityRecords(records: CityCostRecord[], fallbackCountry: string): CityCostRecord | null {

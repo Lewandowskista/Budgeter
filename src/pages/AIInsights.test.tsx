@@ -1,12 +1,13 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { AIAnalysisResult, AppSettings } from '../../shared/types'
+import type { AIAnalysisProgress, AIAnalysisResult, AppSettings } from '../../shared/types'
 import { AIInsightsPage } from './AIInsights'
 
 const mockIpc = vi.hoisted(() => ({
   getSettings: vi.fn(),
   analyzeInsights: vi.fn(),
+  onAIInsightsProgress: vi.fn(),
 }))
 
 vi.mock('@/lib/ipc', () => ({
@@ -19,6 +20,12 @@ const completeSettings: AppSettings = {
   country: 'Romania',
   geminiApiKey: 'secret',
   theme: 'system',
+  onboardingCompleted: '',
+  notifyUpcomingBills: 'true',
+  notifyBudgetAlerts: 'true',
+  notifyIncomeAlerts: 'false',
+  notifyRecurringGaps: 'true',
+  savingsGoal: '20',
 }
 
 const analysis: AIAnalysisResult = {
@@ -26,7 +33,10 @@ const analysis: AIAnalysisResult = {
   periodMonth: '2026-04',
   healthScore: 73,
   explanation: 'Reasonable baseline.',
+  varianceSummary: 'Dining and subscriptions increased against last month.',
   tips: ['Trim subscriptions.'],
+  riskSignals: ['Upcoming recurring bills consume most of the remaining budget.'],
+  safeCutIdeas: ['Pause one streaming plan this month.'],
   positives: ['Savings are healthy.'],
   comparisons: [
     {
@@ -48,6 +58,8 @@ describe('AIInsightsPage', () => {
   beforeEach(() => {
     mockIpc.getSettings.mockReset()
     mockIpc.analyzeInsights.mockReset()
+    mockIpc.onAIInsightsProgress.mockReset()
+    mockIpc.onAIInsightsProgress.mockReturnValue(() => {})
   })
 
   it('shows a missing-settings state before analysis can run', async () => {
@@ -81,6 +93,8 @@ describe('AIInsightsPage', () => {
     expect(await screen.findByText('Estimated city benchmark')).toBeInTheDocument()
     expect(screen.getByText('Confidence: medium')).toBeInTheDocument()
     expect(screen.getByText(/uses an estimated city benchmark/i)).toBeInTheDocument()
+    expect(screen.getByText(/dining and subscriptions increased against last month/i)).toBeInTheDocument()
+    expect(screen.getByText(/pause one streaming plan this month/i)).toBeInTheDocument()
   })
 
   it('shows a retryable error state when analysis fails after setup is complete', async () => {
@@ -123,5 +137,76 @@ describe('AIInsightsPage', () => {
     fireEvent.click(await screen.findByRole('button', { name: /analyze/i }))
 
     expect(await screen.findByText('No expense data for this month')).toBeInTheDocument()
+  })
+
+  it('shows live progress updates and ignores stale progress events', async () => {
+    mockIpc.getSettings.mockResolvedValue(completeSettings)
+
+    let resolveAnalysis: ((value: AIAnalysisResult) => void) | null = null
+    const analysisPromise = new Promise<AIAnalysisResult>((resolve) => {
+      resolveAnalysis = resolve
+    })
+    mockIpc.analyzeInsights.mockReturnValue(analysisPromise)
+
+    let progressListener: ((progress: AIAnalysisProgress) => void) | null = null
+    mockIpc.onAIInsightsProgress.mockImplementation((listener: (progress: AIAnalysisProgress) => void) => {
+      progressListener = listener
+      return () => {}
+    })
+
+    render(
+      <MemoryRouter>
+        <AIInsightsPage />
+      </MemoryRouter>,
+    )
+
+    fireEvent.click(await screen.findByRole('button', { name: /analyze/i }))
+
+    const [{ requestId }] = mockIpc.analyzeInsights.mock.calls[0]
+
+    await act(async () => {
+      progressListener?.({
+        requestId: 'stale-request',
+        stage: 'fetching-benchmarks',
+        message: 'Stale update',
+        percent: 40,
+        isTerminal: false,
+        providerStatuses: {},
+      })
+    })
+
+    expect(screen.queryByText('Stale update')).not.toBeInTheDocument()
+
+    await act(async () => {
+      progressListener?.({
+        requestId,
+        stage: 'fetching-benchmarks',
+        message: 'Checking public benchmark services',
+        percent: 40,
+        isTerminal: false,
+        fallbackSummary: 'Direct city benchmark unavailable, preparing fallback sources.',
+        providerStatuses: {
+          wteCost: { state: 'failed', detail: '403 Forbidden' },
+          worldBank: { state: 'success', durationMs: 612 },
+        },
+      })
+    })
+
+    expect(await screen.findByText('Analysis in progress')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /checking public benchmark services/i })).toBeInTheDocument()
+    expect(screen.getByText('Direct city benchmark unavailable, preparing fallback sources.')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /provider details/i }))
+    expect(screen.getByText('wteCost')).toBeInTheDocument()
+    expect(screen.getByText('403 Forbidden')).toBeInTheDocument()
+    expect(screen.getByText('worldBank')).toBeInTheDocument()
+
+    await act(async () => {
+      resolveAnalysis?.(analysis)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /refresh analysis/i })).toBeInTheDocument()
+    })
   })
 })

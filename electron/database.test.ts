@@ -196,6 +196,38 @@ describe('DatabaseManager recurring transactions', () => {
     expect(recurring[0].lastPostedMonth).toBe('2026-04')
   })
 
+  it('keeps reminder-mode recurring items out of the ledger and surfaces them as upcoming bills', () => {
+    const { manager } = createManager()
+
+    const recurring = manager.saveRecurringTransaction({
+      payee: 'Internet Provider',
+      amount: 59,
+      type: 'expense',
+      category: 'Utilities',
+      note: 'Home internet',
+      dayOfMonth: 18,
+      startMonth: '2026-04',
+      active: true,
+      postingMode: 'reminder',
+      expectedAmount: 59,
+      reminderDays: 5,
+      subscriptionLabel: 'Internet',
+    } as any)
+
+    manager.syncRecurringTransactions(new Date('2026-04-10T09:00:00.000Z'))
+
+    expect(manager.getTransactions({ from: '2026-04-01', to: '2026-04-30' })).toEqual([])
+    expect(manager.getUpcomingBills(new Date('2026-04-10T09:00:00.000Z'))).toEqual([
+      expect.objectContaining({
+        recurringTransactionId: recurring.id,
+        payee: 'Internet Provider',
+        dueDate: '2026-04-18',
+        postingMode: 'reminder',
+        subscriptionLabel: 'Internet',
+      }),
+    ])
+  })
+
   it('preserves incomeSource and clears category when recurring income transactions post', () => {
     const { manager } = createManager()
 
@@ -231,9 +263,9 @@ describe('DatabaseManager budget templates', () => {
   it('auto-applies active templates without overwriting existing month budgets', () => {
     const { manager } = createManager()
 
-    manager.saveBudgetTemplate({ category: 'Food & Dining', amount: 500, active: true })
-    manager.saveBudgetTemplate({ category: 'Transport', amount: 120, active: true })
-    manager.setBudget({ category: 'Food & Dining', amount: 620, month: '2026-05' })
+    manager.saveBudgetTemplate({ category: 'Food & Dining', amount: 500, active: true, rolloverEnabled: false } as any)
+    manager.saveBudgetTemplate({ category: 'Transport', amount: 120, active: true, rolloverEnabled: false } as any)
+    manager.setBudget({ category: 'Food & Dining', amount: 620, month: '2026-05', rolloverEnabled: false } as any)
 
     const mayBudgets = manager.getBudgets('2026-05')
     const categories = mayBudgets.budgets.map((budget) => [budget.category, budget.amount])
@@ -244,6 +276,31 @@ describe('DatabaseManager budget templates', () => {
         ['Transport', 120],
       ]),
     )
+  })
+
+  it('carries rollover budget balances into the next month available-to-spend amount', () => {
+    const { manager } = createManager()
+
+    manager.setBudget({ category: 'Food & Dining', amount: 500, month: '2026-04', rolloverEnabled: true } as any)
+    manager.addTransaction({
+      amount: 320,
+      type: 'expense',
+      category: 'Food & Dining',
+      payee: 'Grocer',
+      date: '2026-04-12',
+      note: '',
+    })
+
+    manager.setBudget({ category: 'Food & Dining', amount: 450, month: '2026-05', rolloverEnabled: true } as any)
+
+    const mayBudget = manager.getBudgets('2026-05').budgets.find((budget) => budget.category === 'Food & Dining')
+
+    expect(mayBudget).toMatchObject({
+      carryoverAmount: 180,
+      availableToSpend: 630,
+      remaining: 630,
+      rolloverEnabled: true,
+    })
   })
 })
 
@@ -381,6 +438,56 @@ describe('DatabaseManager CSV import and payee rules', () => {
     expect(manager.findPayeeRule('Employer')).toBeNull()
     expect(manager.findPayeeRule('Benefits Card')).toBeNull()
     expect(manager.findPayeeRule('Lunch Spot')).toMatchObject({ category: 'Other' })
+  })
+
+  it('marks defaulted and rule-filled CSV imports as pending review while ready rows stay reviewed', () => {
+    const { directory, manager } = createManager()
+    const csvPath = path.join(directory, 'review-import.csv')
+
+    manager.upsertPayeeRule({ payee: 'Metro Pass', category: 'Transport' })
+
+    fs.writeFileSync(
+      csvPath,
+      [
+        'Date,Amount,Payee,Category',
+        '2026-04-02,-12.50,Metro Pass,',
+        '2026-04-03,-8.00,Unknown Merchant,',
+        '2026-04-04,-18.00,Grocer,Food & Dining',
+      ].join('\n'),
+      'utf8',
+    )
+
+    manager.commitTransactionCsvImport({
+      filePath: csvPath,
+      mapping: {
+        date: 'Date',
+        amount: 'Amount',
+        payee: 'Payee',
+        category: 'Category',
+      },
+      amountMode: 'signed',
+      defaultExpenseType: 'expense',
+      learnRules: true,
+    })
+
+    expect(manager.getPendingReviewTransactions()).toEqual([
+      expect.objectContaining({
+        payee: 'Metro Pass',
+        origin: 'csv',
+        reviewStatus: 'pending',
+      }),
+      expect.objectContaining({
+        payee: 'Unknown Merchant',
+        origin: 'csv',
+        reviewStatus: 'pending',
+      }),
+    ])
+
+    const reviewed = manager.getTransactions({ search: 'Grocer' })[0]
+    expect(reviewed).toMatchObject({
+      origin: 'csv',
+      reviewStatus: 'reviewed',
+    })
   })
 })
 
